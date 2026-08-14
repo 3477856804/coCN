@@ -7,14 +7,17 @@ SAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -Wall -Wextra
 ASAN_FLAGS  = -fsanitize=address,undefined
 TSAN_FLAGS  = -fsanitize=thread
 
-TESTS    = $(wildcard 测试/*.co)
-ERRCASES = $(wildcard 测试/错误用例/*.co)
-DEMOS    = $(wildcard 例子/*.co)
+# 测试/原生/ 里的用例双通道都要跑：
+#   解释器侧跟其余套件一样进 test-suite / asan，
+#   原生侧由 native 目标做「输出逐字节一致」校验。
+TESTS       = $(wildcard 测试/*.co) $(wildcard 测试/原生/*.co)
+ERRCASES    = $(wildcard 测试/错误用例/*.co)
+DEMOS       = $(wildcard 例子/*.co)
 
 co: co.c
 	$(CC) $(CFLAGS) -o co co.c $(LDLIBS)
 
-.PHONY: test test-suite test-error test-demo asan asan-error tsan check clean
+.PHONY: test test-suite test-error test-demo asan asan-error tsan native bench check clean
 
 # 默认测试：功能套件 + 错误路径 + 全部例子
 test: test-suite test-error test-demo
@@ -85,6 +88,19 @@ asan-error: co.c
 		else echo "干净"; fi; \
 	done
 
+# 原生编译通道：同一份源码走解释器与走原生二进制，
+# 标准输出/标准错误必须逐字节相同、退出码必须一致。
+# 这条不成立，原生后端就不可信，所以必须进 check。
+native: co
+	@sh 测试/原生一致性.sh ./co
+
+# 性能基准：两条通道的计算结果必须一致（这部分是门禁），
+# 顺带打印加速比与原生产物体积/依赖（这部分是报告）。
+# 基准文件放在 测试/基准/ 而不是 测试/ 下，是为了不被 TESTS 的 wildcard 卷进
+# ASan 轮次——ASan 会把两百万次循环拖慢十几倍，白等。
+bench: co
+	@sh 测试/基准运行.sh ./co 测试/基准/性能基准.co
+
 # 数据竞争检查（针对并发用例）
 tsan: co.c
 	$(CC) $(SAN_CFLAGS) $(TSAN_FLAGS) -o co_tsan co.c $(LDLIBS)
@@ -98,9 +114,9 @@ tsan: co.c
 	done
 
 # 提交前的完整门禁
-check: test asan asan-error tsan
+check: test native bench asan asan-error tsan
 	@echo "===================================="
-	@echo " 全部门禁通过：功能 + 错误路径 + ASan/UBSan + 错误路径内存安全 + TSan"
+	@echo " 全部门禁通过：功能 + 错误路径 + 原生双通道一致 + 基准结果一致 + ASan/UBSan + 错误路径内存安全 + TSan"
 	@echo "===================================="
 
 clean:

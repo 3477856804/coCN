@@ -12,6 +12,7 @@
 #include <setjmp.h>
 #include <sys/resource.h>   /* getrlimit：探测真实栈容量 */
 #include <errno.h>          /* strtoull 溢出检测：进制字面量必须拒绝越界而非静默回绕 */
+#include <unistd.h>         /* getpid：原生编译后端临时文件名 */
 
 /* ========== 基础定义 ========== */
 #define MAX_ID_LEN     128
@@ -826,6 +827,39 @@ static void env_set(Env *e, const char *name, Value *val) {
     }
 }
 
+/* 赋值（区别于声明）：沿作用域链找到【已存在】的绑定并原地更新。
+ *
+ * 为什么必须和 env_set 分开：env_set 只看当前作用域，找不到就【新建】绑定。
+ * 赋值语句原先直接用 env_set，于是函数体里的 `计数 = 计数 + 1` 会在函数的局部
+ * 作用域里新建一个 `计数` 把全局那个遮蔽掉——读到的是全局旧值，写进去的是局部副本，
+ * 函数一返回修改就蒸发。表现为「每次调用都返回 1，全局始终是 0」，
+ * 属于最危险的一类缺陷：不报错、能跑、结果错。
+ * 计数器 / 累加器 / 缓存 / 分配器这些依赖全局可变状态的写法全都因此失效，
+ * 而它们正是系统级代码的地基，所以这条必须修对。
+ *
+ * 找不到时的处理：退化为在当前作用域定义（保持既有的隐式声明行为不变），
+ * 真正的「未声明即赋值」检查放在调用方，以便带上行列号报错。
+ * 遍历同样用迭代而非递归：作用域链长度等于调用深度，递归会在深递归时撑爆栈。
+ */
+static int env_assign(Env *e, const char *name, Value *val) {
+    for (Env *cur = e; cur; cur = cur->parent) {
+        ENV_LOCK(cur);
+        for (int i = 0; i < cur->count; i++) {
+            if (strcmp(cur->names[i], name) == 0) {
+                /* 先 retain 新值再 free 旧值：若二者是同一个对象（`x = x`），
+                   顺序颠倒会先把它释放掉，随后 retain 一块已死内存。 */
+                Value *nv = val_retain_root(val);
+                val_free(cur->values[i]);
+                cur->values[i] = nv;
+                ENV_UNLOCK(cur);
+                return 1;                /* 命中已有绑定 */
+            }
+        }
+        ENV_UNLOCK(cur);
+    }
+    return 0;                            /* 整条链上都没有 */
+}
+
 /* 记录/查询变量类型标注（用于静态类型检查） */
 static void env_set_type(Env *e, const char *name, const char *type) {
     ENV_LOCK(e);
@@ -1041,14 +1075,46 @@ static void advance() {
             if (src[src_pos] != '_' && bn < (int)sizeof(buf) - 1) buf[bn++] = src[src_pos];
             src_pos++; src_col++;
         }
+        int has_dot = 0;
         if (src[src_pos] == '.') {
+            has_dot = 1;
             if (bn < (int)sizeof(buf) - 1) buf[bn++] = '.';
             src_pos++; src_col++;
             while (isdigit((unsigned char)src[src_pos]) || src[src_pos] == '_') {
                 if (src[src_pos] != '_' && bn < (int)sizeof(buf) - 1) buf[bn++] = src[src_pos];
                 src_pos++; src_col++;
             }
+        }
+        /* 科学计数法：1e10 / 1.5e-3 / 2E+8。
+           必须【先前瞻确认】e 后面真有数字才吞掉，否则 `1 e` 这种
+           「整数紧跟标识符」的写法会被误读成半个指数。
+           指数一出现，结果无条件是浮点（1e2 是 100.0，不是整数 100）。 */
+        {
+            char ec = src[src_pos];
+            if (ec == 'e' || ec == 'E') {
+                int k = src_pos + 1;
+                if (src[k] == '+' || src[k] == '-') k++;
+                if (isdigit((unsigned char)src[k])) {
+                    has_dot = 1;                       /* 走浮点分支 */
+                    if (bn < (int)sizeof(buf) - 1) buf[bn++] = 'e';
+                    src_pos++; src_col++;
+                    if (src[src_pos] == '+' || src[src_pos] == '-') {
+                        if (bn < (int)sizeof(buf) - 1) buf[bn++] = src[src_pos];
+                        src_pos++; src_col++;
+                    }
+                    while (isdigit((unsigned char)src[src_pos]) || src[src_pos] == '_') {
+                        if (src[src_pos] != '_' && bn < (int)sizeof(buf) - 1) buf[bn++] = src[src_pos];
+                        src_pos++; src_col++;
+                    }
+                }
+            }
+        }
+        if (has_dot) {
             buf[bn] = 0;
+            /* 指数溢出（1e999）必须报错，不能静默变成 inf */
+            errno = 0;
+            double dv = strtod(buf, NULL);
+            if (errno == ERANGE || isinf(dv)) lex_error("浮点字面量超出范围");
             memcpy(cur_tok.text, buf, bn + 1);
             cur_tok.type = TOK_FLOAT;
         } else {
@@ -1240,10 +1306,40 @@ static void process_escape(char *dest, const char *src, int len) {
 }
 
 
+/* token 的人话名字：报错里出现裸枚举号（"期望 26"）等于没有报错信息，
+   使用者无从下手。表的下标必须与 TokenType 声明顺序严格一致。 */
+static const char *tok_name(TokenType t) {
+    static const char *names[] = {
+        "文件结束", "标识符", "整数字面量", "浮点字面量", "字符串", "多行字符串",
+        "'+'", "'-'", "'*'", "'/'", "'//'", "'%'",
+        "'=='", "'!='", "'<'", "'<='", "'>'", "'>='",
+        "'&'", "'|'", "'^'", "'~'", "'<<'", "'>>'",
+        "'='", "'('", "')'", "'['", "']'",
+        "'{'", "'}'", "':'", "','", "换行", "'.'",
+        "变量声明(让/变量)", "常量", "函数", "返回", "如果", "则",
+        "否则", "否则如果", "结束", "当", "循环", "跳出", "继续",
+        "输出", "张量", "对于", "从", "到", "步长",
+        "且", "或", "非",
+        "真", "假", "导入", "匹配", "是", "默认", "于", "'->'",
+        "类型 整数", "类型 浮点", "类型 字符串", "类型 布尔",
+        "类型 列表", "类型 字典", "类型 空",
+        "类型 数字", "类型 函数值", "类型 任意",
+        "并发", "等待",
+        "尝试", "捕获", "最终", "抛出"
+    };
+    int n = (int)(sizeof(names) / sizeof(names[0]));
+    if ((int)t < 0 || (int)t >= n) return "未知token";
+    return names[t];
+}
+
 static void expect(TokenType t) {
     if (cur_tok.type != t) {
-        fprintf(stderr, "语法错误 (第%d行,%d列): 期望 %d, 得到 '%s'\n",
-                cur_tok.line, cur_tok.col, t, cur_tok.text);
+        /* 换行的 text 是真正的 '\n'，直接打进错误里会把提示折断 */
+        const char *got = (cur_tok.type == TOK_NEWLINE) ? "换行"
+                        : (cur_tok.type == TOK_EOF)     ? "文件结束"
+                                                        : cur_tok.text;
+        fprintf(stderr, "语法错误 (第%d行,%d列): 期望 %s, 得到 '%s'\n",
+                cur_tok.line, cur_tok.col, tok_name(t), got);
         exit(1);
     }
     advance();
@@ -1440,6 +1536,17 @@ static Node *make_node(NodeType t) {
 }
 
 static Node *parse_primary() {
+    /* 空值字面量。`空` 同时是类型标注关键字（TK_TYPE_NULL），这里按【上下文关键字】处理：
+       类型只出现在声明/返回标注位，而 parse_primary 是表达式位，两者不会撞车。
+       补这个是因为原先 val_to_string 会打印「空」，源码里却写不出「空」——
+       能打印却写不出，round-trip 就断了，这属于语言级不自洽。 */
+    if (cur_tok.type == TK_TYPE_NULL) {
+        Node *n = make_node(ND_LITERAL);
+        n->literal.lit_type = VAL_NULL;
+        n->literal.value = strdup("空");
+        advance();
+        return n;
+    }
     if (cur_tok.type == TK_TRUE || cur_tok.type == TK_FALSE) {
         Node *n = make_node(ND_LITERAL);
         n->literal.lit_type = VAL_BOOL;   /* 布尔是一等类型，不再退化为整数 0/1 */
@@ -1895,10 +2002,63 @@ static Node *parse_var_decl() {
     return n;
 }
 
+/* 判定 `输出(` 之后的括号是「实参表」还是「分组括号」。
+   `输出("x:", a)` 是最自然的写法，但 `输出 (1+2)*3` 里的括号只是分组——
+   两者都必须成立，所以这里做纯 token 级前瞻：跳到与当前 '(' 配对的 ')'，
+   看紧随其后的 token 能否延续表达式。不构造任何 AST，因此回退零成本。 */
+static int print_paren_is_arglist(void) {
+    /* 快照词法器全部可变状态；cur_tok 是 '('，词法器已把深度加过 1 */
+    int s_pos = src_pos, s_line = src_line, s_col = src_col, s_depth = g_bracket_depth;
+    Token s_tok = cur_tok;
+    int depth = 1, saw_top_comma = 0, verdict = 0;
+    for (;;) {
+        advance();
+        if (cur_tok.type == TOK_EOF) goto done;   /* 括号不配对：交给常规路径原样报错 */
+        if (cur_tok.type == TOK_LPAREN || cur_tok.type == TOK_LBRACK || cur_tok.type == TOK_LBRACE) {
+            depth++;
+        } else if (cur_tok.type == TOK_RPAREN || cur_tok.type == TOK_RBRACK || cur_tok.type == TOK_RBRACE) {
+            if (--depth == 0) break;
+        } else if (cur_tok.type == TOK_COMMA && depth == 1) {
+            saw_top_comma = 1;
+        }
+    }
+    advance();  /* 配对 ')' 之后的那个 token 决定归属 */
+    switch (cur_tok.type) {
+        /* 这些 token 会把括号变成子表达式的一部分 => 括号是分组 */
+        case TOK_PLUS: case TOK_MINUS: case TOK_STAR: case TOK_SLASH:
+        case TOK_DBLSLASH: case TOK_MOD:
+        case TOK_EQ: case TOK_NE: case TOK_LT: case TOK_LE: case TOK_GT: case TOK_GE:
+        case TOK_AMP: case TOK_PIPE: case TOK_CARET: case TOK_SHL: case TOK_SHR:
+        case TK_AND: case TK_OR:
+        case TOK_LBRACK: case TOK_LPAREN: case TOK_DOT:
+            verdict = 0; break;
+        default:
+            verdict = 1; break;
+    }
+    /* 顶层逗号只可能来自实参表：`(a, b) * 2` 在本语言里没有元组语义 */
+    if (saw_top_comma) verdict = 1;
+done:
+    src_pos = s_pos; src_line = s_line; src_col = s_col;
+    g_bracket_depth = s_depth; cur_tok = s_tok;
+    return verdict;
+}
+
 static Node *parse_print() {
     advance();
     Node **args = NULL; int cnt = 0, cap = 0;
-    if (cur_tok.type != TOK_NEWLINE && cur_tok.type != TOK_EOF) {
+    if (cur_tok.type == TOK_LPAREN && print_paren_is_arglist()) {
+        /* 形式一：输出(实参, 实参, ...) —— 与函数调用写法完全一致 */
+        advance();                                  /* 吃掉 '(' */
+        if (cur_tok.type != TOK_RPAREN) {
+            do {
+                Node *arg = parse_expression();
+                if (cnt >= cap) { cap = cap ? cap*2 : 4; args = realloc(args, cap * sizeof(Node*)); }
+                args[cnt++] = arg;
+            } while (cur_tok.type == TOK_COMMA && (advance(), 1));
+        }
+        expect(TOK_RPAREN);
+    } else if (cur_tok.type != TOK_NEWLINE && cur_tok.type != TOK_EOF) {
+        /* 形式二：输出 实参, 实参, ... —— 免括号写法 */
         do {
             Node *arg = parse_expression();
             if (cnt >= cap) { cap = cap ? cap*2 : 4; args = realloc(args, cap * sizeof(Node*)); }
@@ -2453,6 +2613,21 @@ static Value *builtin_input(int argc, Value **argv) {
         r->sval = strdup("");
     }
     return r;
+}
+
+/* 输出错误：把内容写到 stderr，与 stdout 分流。
+   系统编程的硬需求——诊断信息不能污染数据管道，否则 `co 程序 | 下游` 就废了。
+   语义与 `输出` 完全一致（空格分隔 + 换行），只是目标流不同。
+   stderr 无缓冲，因此崩溃前的最后一条诊断不会丢。 */
+static Value *builtin_eprint(int argc, Value **argv) {
+    for (int i = 0; i < argc; i++) {
+        char *s = val_to_string(argv[i]);
+        fprintf(stderr, "%s", s);
+        if (i < argc - 1) fprintf(stderr, " ");
+        free(s);
+    }
+    fprintf(stderr, "\n");
+    return val_new(VAL_NULL);
 }
 
 /* 数学函数 */
@@ -4270,6 +4445,7 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "转浮点") == 0) return builtin_float(argc, argv);
     if (strcmp(name, "转字符串") == 0) return builtin_str(argc, argv);
     if (strcmp(name, "输入") == 0) return builtin_input(argc, argv);
+    if (strcmp(name, "输出错误") == 0) return builtin_eprint(argc, argv);
     /* 数学函数 */
     if (strcmp(name, "绝对值") == 0) return builtin_abs(argc, argv);
     if (strcmp(name, "平方根") == 0) return builtin_sqrt(argc, argv);
@@ -5143,7 +5319,10 @@ static void exec_node(Node *n, Env *env) {
                 if (old && old->type == VAL_FUNC) runtime_error(n->assign.tgt, "不能给函数名赋值");
                 const char *t = env_get_type(env, n->assign.tgt->ident.name);
                 if (t) ensure_type(t, val, n->assign.tgt, "赋值");
-                env_set(env, n->assign.tgt->ident.name, val);
+                /* 沿作用域链更新已有绑定；链上没有才在当前作用域新建。
+                   这样函数体里对全局变量的赋值才会真正写回全局。 */
+                if (!env_assign(env, n->assign.tgt->ident.name, val))
+                    env_set(env, n->assign.tgt->ident.name, val);
             } else if (n->assign.tgt->type == ND_BINARY &&
                        strcmp(n->assign.tgt->binary.op, "[]") == 0) {
                 if (assign_tensor(n->assign.tgt, val, env)) {
@@ -5243,6 +5422,11 @@ static void exec_node(Node *n, Env *env) {
                 step = num_of(step_v, "循环步长");
                 step_is_float = (step_v->type == VAL_FLOAT);
                 val_free(step_v);
+                /* 步长 0 必须报错：原来的 direction = (0>0)?1:-1 会得到 -1，
+                   于是「从小到大」的循环条件立刻不成立，整个循环体被【静默跳过】。
+                   这属于「能跑但结果错」，比死循环更难查。范围() 早已拒绝 0，
+                   对于 也必须一致。 */
+                if (step == 0) runtime_error(n, "循环步长不能为 0");
             }
             /* 浮点判定基于求值后的实际值类型（起止可为任意表达式，而非仅字面量） */
             int is_float = (start_v->type == VAL_FLOAT || end_v->type == VAL_FLOAT || step_is_float);
@@ -5528,12 +5712,756 @@ static void exec_node(Node *n, Env *env) {
     }
 }
 
+/* ===================================================================
+   原生编译后端（co → 自包含 C 源码转译）
+   -------------------------------------------------------------------
+   设计目标：把 co 源码转译为【不依赖解释器运行时】的纯 C 程序，再用
+   cc 编译即可得到原生二进制。这是让 co 能写系统/内核程序的基石
+   （树遍历解释器无法在真实内核态运行，必须走到原生编译）。
+
+   当前 MVP 覆盖：整数/浮点/布尔/字符串、全部算术/比较/逻辑/位运算、
+   如果/否则若/否则、当、对于(含步长)、跳出/继续、返回、函数(含递归/
+   互递归)、以及常用内置。列表/字典/张量/异常/并发/导入/模式匹配
+   暂不在 MVP 内——遇到即给出清晰的中文编译错误，绝不静默产生错误结果。
+   =================================================================== */
+
+typedef struct {
+    FILE *out;
+    char *g_names[1024]; char *g_cnames[1024]; int g_n;        /* 全局变量 */
+    char *f_names[1024]; char *f_cnames[1024]; int f_n;        /* 函数 */
+    int  f_pcnt[1024];
+    char *l_names[1024]; char *l_cnames[1024]; int l_n;        /* 当前函数局部 */
+    char *cl_names[512]; char *cl_cnames[512]; int cl_n;        /* 当前函数参数 */
+    char *cleanup[1024]; int cleanup_n;                         /* 需清理的局部/参数 */
+    int tmp;        /* 临时变量计数器 */
+    int label;      /* 标签/数组名计数器 */
+    int in_func;    /* 是否正在生成函数体 */
+    int used_cleanup; /* 本函数体内是否真的发射过 goto _cleanup（无 返回 的函数就不该发标签） */
+} NGen;
+
+/* ---- 前向声明 ---- */
+static void   ng_error(NGen *g, Node *n, const char *fmt, ...);
+static char  *ng_lookup(char **names, char **cnames, int n, const char *name);
+static char  *ng_add(NGen *g, char **names, char **cnames, int *n, const char *name, const char *prefix);
+static char  *ng_resolve(NGen *g, const char *name);
+static char  *ng_local(NGen *g, const char *name);
+static char  *ng_register_func(NGen *g, const char *name, int pcnt);
+static const char *ng_builtin_cname(const char *name);
+static long   ng_parse_int(const char *s, int *ok);
+static void    ng_emit_cstr(NGen *g, const char *s);
+static char  *ng_expr(NGen *g, Node *n);
+static void    ng_expr_call(NGen *g, Node *n, const char *tmp);
+static void    ng_stmt(NGen *g, Node *n);
+static void    ng_if_chain(NGen *g, Node *n, int b);
+static void    ng_if_branch(NGen *g, Node *n, int b);
+static void    ng_while(NGen *g, Node *n);
+static void    ng_for(NGen *g, Node *n);
+static void    ng_collect(NGen *g, Node *n);
+static void    ng_function(NGen *g, Node *n);
+static void    ng_emit_runtime(FILE *out);
+static int     compile_program_to_c(Node *prog, const char *outpath);
+static int     do_compile(const char *mode, const char *infile, const char *outarg);
+
+static void ng_error(NGen *g, Node *n, const char *fmt, ...) {
+    (void)g;
+    va_list ap; va_start(ap, fmt);
+    fprintf(stderr, "原生编译错误");
+    if (n) fprintf(stderr, " (第%d行,%d列)", n->line, n->col);
+    fprintf(stderr, ": ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    exit(2);
+}
+
+static char *ng_lookup(char **names, char **cnames, int n, const char *name) {
+    for (int i = 0; i < n; i++) if (strcmp(names[i], name) == 0) return cnames[i];
+    return NULL;
+}
+
+static char *ng_add(NGen *g, char **names, char **cnames, int *n, const char *name, const char *prefix) {
+    (void)g;
+    char *c = ng_lookup(names, cnames, *n, name);
+    if (c) return c;
+    char buf[32]; snprintf(buf, sizeof buf, "%s%d", prefix, *n);
+    names[*n] = strdup(name); cnames[*n] = strdup(buf); (*n)++;
+    return cnames[(*n) - 1];
+}
+
+/* 标识符解析：参数 > 局部 > 全局 */
+static char *ng_resolve(NGen *g, const char *name) {
+    for (int i = 0; i < g->cl_n; i++) if (strcmp(g->cl_names[i], name) == 0) return g->cl_cnames[i];
+    if (g->in_func) { char *c = ng_lookup(g->l_names, g->l_cnames, g->l_n, name); if (c) return c; }
+    return ng_lookup(g->g_names, g->g_cnames, g->g_n, name);
+}
+
+/* 登记局部名（函数内→l_，否则→g_） */
+static char *ng_local(NGen *g, const char *name) {
+    if (g->in_func) {
+        char *c;
+        if ((c = ng_lookup(g->cl_names, g->cl_cnames, g->cl_n, name))) return c;
+        if ((c = ng_lookup(g->l_names, g->l_cnames, g->l_n, name))) return c;
+        return ng_add(g, g->l_names, g->l_cnames, &g->l_n, name, "l");
+    }
+    return ng_add(g, g->g_names, g->g_cnames, &g->g_n, name, "g");
+}
+
+static char *ng_register_func(NGen *g, const char *name, int pcnt) {
+    int idx = -1;
+    for (int i = 0; i < g->f_n; i++) if (strcmp(g->f_names[i], name) == 0) { idx = i; break; }
+    if (idx < 0) {
+        char buf[32]; snprintf(buf, sizeof buf, "f%d", g->f_n);
+        g->f_names[g->f_n] = strdup(name); g->f_cnames[g->f_n] = strdup(buf);
+        g->f_pcnt[g->f_n] = pcnt; idx = g->f_n; g->f_n++;
+    } else {
+        g->f_pcnt[idx] = pcnt;
+    }
+    return g->f_cnames[idx];
+}
+
+/* 内置函数名 → 运行时 C 函数名（coCN 别名折叠为同一实现） */
+static const char *ng_builtin_cname(const char *name) {
+    static const struct { const char *cn; const char *cf; } tbl[] = {
+        {"内置输出","cv_b_print"},{"输出","cv_b_print"},{"打印","cv_b_print"},
+        {"输出错误","cv_b_eprint"},
+        {"断言","cv_b_assert"},{"断言相等","cv_b_assert_eq"},
+        /* 名字必须与解释器 call_builtin 里注册的完全一致：
+           同一份源码在两条通道下要么都能跑，要么都报错，不允许出现
+           「解释器认、原生编译器不认」这种通道差异。 */
+        {"转字符串","cv_b_str"},{"转整数","cv_b_int"},
+        {"转浮点","cv_b_flt"},{"转布尔","cv_b_bool"},
+        {"取整","cv_b_round"},{"向下取整","cv_b_floor"},{"向上取整","cv_b_ceil"},{"截断","cv_b_trunc"},
+        {"长度","cv_b_len"},{"类型","cv_b_type"},
+        {"绝对值","cv_b_abs"},{"符号","cv_b_sign"},
+        {"幂","cv_b_pow"},{"平方根","cv_b_sqrt"},{"自然对数","cv_b_ln"},
+        {"正弦","cv_b_sin"},{"余弦","cv_b_cos"},{"正切","cv_b_tan"},{"圆周率","cv_b_pi"},
+        {"最大值","cv_b_max"},{"最小值","cv_b_min"},
+        {"十六进制","cv_b_hex"},{"二进制","cv_b_bin"},{"八进制","cv_b_oct"},
+        {"位计数","cv_b_popcount"},{"取位","cv_b_getbit"},{"置位","cv_b_setbit"},
+        {"字节数","cv_b_bytelen"},{"字节","cv_b_byteat"},
+        /* 字符串处理：系统工具链里最常用的一组，原生通道必须齐备 */
+        {"大写","cv_b_upper"},{"小写","cv_b_lower"},
+        {"去空白","cv_b_strip"},{"去左空白","cv_b_lstrip"},{"去右空白","cv_b_rstrip"},
+        {"重复","cv_b_repeat"},{"开头是","cv_b_startswith"},{"结尾是","cv_b_endswith"},
+        {"字符码","cv_b_ord"},{"码转字符","cv_b_chr"},
+        {"截取","cv_b_substr"},{"查找","cv_b_find"},{"替换","cv_b_replace"},
+        {"时钟","cv_b_clock"},
+        {NULL,NULL}
+    };
+    for (int i = 0; tbl[i].cn; i++) if (strcmp(tbl[i].cn, name) == 0) return tbl[i].cf;
+    return NULL;
+}
+
+/* 解析整数字面量：支持 0x/0b/0o 与 _ 分隔符，溢出报错 */
+static long ng_parse_int(const char *s, int *ok) {
+    *ok = 1;
+    char buf[128]; int bi = 0;
+    for (int i = 0; s[i] && bi < 127; i++) if (s[i] != '_') buf[bi++] = s[i];
+    buf[bi] = 0;
+    int base = 10; const char *num = buf;
+    if (buf[0] == '0' && (buf[1] == 'x' || buf[1] == 'X')) { base = 16; num = buf + 2; }
+    else if (buf[0] == '0' && (buf[1] == 'b' || buf[1] == 'B')) { base = 2; num = buf + 2; }
+    else if (buf[0] == '0' && (buf[1] == 'o' || buf[1] == 'O')) { base = 8; num = buf + 2; }
+    errno = 0;
+    char *end; long v = strtoll(num, &end, base);
+    if (errno == ERANGE || v > 9223372036854775807LL) { *ok = 0; return 0; }
+    return v;
+}
+
+/* 输出合法的 C 字符串字面量（转义引号/反斜杠/控制字符，UTF-8 原样保留） */
+static void ng_emit_cstr(NGen *g, const char *s) {
+    fputc('"', g->out);
+    for (const char *p = s; p && *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"') fputs("\\\"", g->out);
+        else if (c == '\\') fputs("\\\\", g->out);
+        else if (c == '\n') fputs("\\n", g->out);
+        else if (c == '\t') fputs("\\t", g->out);
+        else if (c == '\r') fputs("\\r", g->out);
+        else if (c < 0x20) fprintf(g->out, "\\x%02X", c);
+        else fputc(c, g->out);
+    }
+    fputc('"', g->out);
+}
+
+/* 生成表达式：声明 `CoVal <tmpN> = ...`，返回 tmpN（调用者负责在该作用域 cv_free 之） */
+static char *ng_expr(NGen *g, Node *n) {
+    if (!n) return strdup("cv_null()");
+    char tmp[32]; snprintf(tmp, sizeof tmp, "t%d", g->tmp++);
+    switch (n->type) {
+    case ND_LITERAL: {
+        if (n->literal.lit_type == VAL_INT) {
+            int ok; long v = ng_parse_int(n->literal.value, &ok);
+            if (!ok) ng_error(g, n, "整数字面量超出范围: %s", n->literal.value);
+            fprintf(g->out, "    CoVal %s = cv_int(%ld);\n", tmp, v);
+        } else if (n->literal.lit_type == VAL_FLOAT) {
+            char buf[160]; int bi = 0;
+            for (int i = 0; n->literal.value[i] && bi < 159; i++)
+                if (n->literal.value[i] != '_') buf[bi++] = n->literal.value[i];
+            buf[bi] = 0;
+            /* 不把源码文本原样塞进 C：先解析成 double，再用 %.17g 规范化输出。
+               %.17g 能精确往返 IEEE754 双精度，同时保证发射的一定是合法 C 字面量
+               （源码里的 1_5.5e_3 之类写法不会污染生成代码）。 */
+            errno = 0;
+            double dv = strtod(buf, NULL);
+            if (errno == ERANGE || isinf(dv)) ng_error(g, n, "浮点字面量超出范围: %s", n->literal.value);
+            fprintf(g->out, "    CoVal %s = cv_flt(%.17g);\n", tmp, dv);
+        } else if (n->literal.lit_type == VAL_BOOL) {
+            fprintf(g->out, "    CoVal %s = cv_bool(%s);\n", tmp, strcmp(n->literal.value, "1") == 0 ? "1" : "0");
+        } else if (n->literal.lit_type == VAL_STRING) {
+            fprintf(g->out, "    CoVal %s = cv_str_dupv(", tmp);
+            ng_emit_cstr(g, n->literal.value);
+            fprintf(g->out, ");\n");
+        } else if (n->literal.lit_type == VAL_NULL) {
+            fprintf(g->out, "    CoVal %s = cv_null();\n", tmp);
+        } else {
+            ng_error(g, n, "原生编译暂不支持该字面量类型");
+        }
+        break;
+    }
+    case ND_IDENT: {
+        char *c = ng_resolve(g, n->ident.name);
+        if (!c) ng_error(g, n, "未定义变量: %s", n->ident.name);
+        fprintf(g->out, "    CoVal %s = cv_retain(%s);\n", tmp, c);
+        break;
+    }
+    case ND_UNARY: {
+        const char *op = n->unary.op;
+        char *e = ng_expr(g, n->unary.operand);
+        if (strcmp(op, "+") == 0) fprintf(g->out, "    CoVal %s = %s;\n", tmp, e);
+        else if (strcmp(op, "-") == 0) fprintf(g->out, "    CoVal %s = cv_unary_neg(%s);\n", tmp, e);
+        else if (strcmp(op, "not") == 0) fprintf(g->out, "    CoVal %s = cv_bool(!cv_truthy(%s));\n", tmp, e);
+        else if (strcmp(op, "~") == 0) fprintf(g->out, "    CoVal %s = cv_unary_bnot(%s);\n", tmp, e);
+        else ng_error(g, n, "不支持的一元运算符: %s", op);
+        free(e);
+        break;
+    }
+    case ND_BINARY: {
+        const char *op = n->binary.op;
+        if (strcmp(op, "[]") == 0) {
+            char *l = ng_expr(g, n->binary.left); char *r = ng_expr(g, n->binary.right);
+            /* 结果变量必须声明在【块外】：声明在块内则出块即失效，
+               后续 `_aN[i] = tmp;` 会引用到不存在的名字。 */
+            fprintf(g->out, "    CoVal %s;\n", tmp);
+            fprintf(g->out,
+                "    { CoVal _L = %s, _R = %s; long _idx = cv_num(_R);"
+                " const char *_cs = (_L.tag == CV_STR ? _L.s : \"\");"
+                " long _sl = cv_utf8_len(_cs); long _ci = (_idx < 0) ? _idx + _sl : _idx;"
+                " if (_ci < 0 || _ci >= _sl) cv_die(\"字符串索引越界\");"
+                " char _cb[8]; cv_utf8_char(_cs, _ci, _cb);"
+                " %s = cv_str_take(cv_str_dup(_cb)); cv_free(_L); cv_free(_R); }\n",
+                l, r, tmp);
+            free(l); free(r);
+            break;
+        }
+        if (strcmp(op, "且") == 0 || strcmp(op, "或") == 0) {
+            /* 短路语义：右操作数在条件不成立时【绝不能被求值】。
+               ng_expr 产出的是一串语句（不是 C 表达式），所以右操作数必须
+               整段生成在分支体内部；早先写成 `CoVal _R = <语句>` 是错的。
+               临时名带上 tmp 后缀，保证 且/或 嵌套时不互相遮蔽。 */
+            char *l = ng_expr(g, n->binary.left);
+            fprintf(g->out, "    CoVal %s;\n", tmp);
+            fprintf(g->out, "    { CoVal _L_%s = %s; int _r_%s;\n", tmp, l, tmp);
+            if (strcmp(op, "且") == 0) {
+                fprintf(g->out, "      if (cv_truthy(_L_%s)) {\n", tmp);
+                char *r = ng_expr(g, n->binary.right);
+                fprintf(g->out, "        _r_%s = cv_truthy(%s); cv_free(%s);\n", tmp, r, r);
+                fprintf(g->out, "      } else { _r_%s = 0; }\n", tmp);
+                free(r);
+            } else {
+                fprintf(g->out, "      if (cv_truthy(_L_%s)) { _r_%s = 1; } else {\n", tmp, tmp);
+                char *r = ng_expr(g, n->binary.right);
+                fprintf(g->out, "        _r_%s = cv_truthy(%s); cv_free(%s);\n", tmp, r, r);
+                fprintf(g->out, "      }\n");
+                free(r);
+            }
+            fprintf(g->out, "      %s = cv_bool(_r_%s); cv_free(_L_%s); }\n", tmp, tmp, tmp);
+            free(l);
+            break;
+        }
+        char *l = ng_expr(g, n->binary.left); char *r = ng_expr(g, n->binary.right);
+        fprintf(g->out, "    CoVal %s = cv_bin(%s, \"%s\", %s);\n", tmp, l, op, r);
+        free(l); free(r);
+        break;
+    }
+    case ND_FUNC_CALL:
+        ng_expr_call(g, n, tmp);
+        break;
+    default:
+        ng_error(g, n, "原生编译暂不支持的表达式节点(类型 %d)", n->type);
+    }
+    return strdup(tmp);
+}
+
+static void ng_expr_call(NGen *g, Node *n, const char *tmp) {
+    if (n->func_call.callee->type != ND_IDENT)
+        ng_error(g, n, "原生编译 MVP 仅支持按名称调用函数（暂不支持把函数值存入变量后调用）");
+    const char *name = n->func_call.callee->ident.name;
+    int nargs = n->func_call.acnt;
+    int lab = g->label++;
+    fprintf(g->out, "    CoVal _a%d[%d];\n", lab, nargs > 0 ? nargs : 1);
+    for (int i = 0; i < nargs; i++) {
+        char *e = ng_expr(g, n->func_call.args[i]);
+        fprintf(g->out, "    _a%d[%d] = %s;\n", lab, i, e);
+        free(e);
+    }
+    char fn[40];
+    if (ng_lookup(g->f_names, g->f_cnames, g->f_n, name)) {
+        snprintf(fn, sizeof fn, "%s", ng_lookup(g->f_names, g->f_cnames, g->f_n, name));
+        /* 用户函数的元数在第一遍就全部登记完毕（互递归也不例外），
+           所以参数个数不匹配可以在【编译期】就抓出来——这是原生通道
+           相对解释器的真实增益：错误从运行期左移到编译期。 */
+        for (int i = 0; i < g->f_n; i++) {
+            if (strcmp(g->f_names[i], name) != 0) continue;
+            if (g->f_pcnt[i] != nargs)
+                ng_error(g, n, "调用 %s 的参数个数不匹配：需要 %d 个，实际给了 %d 个",
+                         name, g->f_pcnt[i], nargs);
+            break;
+        }
+        fprintf(g->out, "    CoVal %s = %s(_a%d, %d);\n", tmp, fn, lab, nargs);
+    } else {
+        const char *bc = ng_builtin_cname(name);
+        if (!bc) ng_error(g, n, "未支持的函数或内置: %s（原生编译 MVP 仅支持用户函数与一部分内置）", name);
+        fprintf(g->out, "    CoVal %s = %s(_a%d, %d);\n", tmp, bc, lab, nargs);
+    }
+    for (int i = 0; i < nargs; i++) fprintf(g->out, "    cv_free(_a%d[%d]);\n", lab, i);
+}
+
+static void ng_stmt(NGen *g, Node *n) {
+    if (!n) return;
+    switch (n->type) {
+    case ND_VAR_DECL: {
+        char *c = ng_local(g, n->var_decl.name);
+        if (n->var_decl.init) {
+            char *e = ng_expr(g, n->var_decl.init);
+            fprintf(g->out, "    cv_free(%s); %s = cv_retain(%s); cv_free(%s);\n", c, c, e, e);
+            free(e);
+        }
+        break;
+    }
+    case ND_ASSIGN: {
+        if (n->assign.tgt->type == ND_IDENT) {
+            char *c = ng_resolve(g, n->assign.tgt->ident.name);
+            if (!c) ng_error(g, n, "未定义变量: %s", n->assign.tgt->ident.name);
+            char *e = ng_expr(g, n->assign.val);
+            fprintf(g->out, "    cv_free(%s); %s = cv_retain(%s); cv_free(%s);\n", c, c, e, e);
+            free(e);
+        } else if (n->assign.tgt->type == ND_BINARY && strcmp(n->assign.tgt->binary.op, "[]") == 0) {
+            ng_error(g, n, "原生编译 MVP 暂不支持字符串/容器索引赋值");
+        } else {
+            ng_error(g, n, "无效的赋值目标");
+        }
+        break;
+    }
+    case ND_IF:      ng_if_chain(g, n, 0); break;
+    case ND_WHILE:   ng_while(g, n); break;
+    case ND_FOR:     ng_for(g, n); break;
+    case ND_RETURN: {
+        if (n->ret_stmt.val) {
+            char *e = ng_expr(g, n->ret_stmt.val);
+            if (g->in_func) { fprintf(g->out, "    { CoVal _rv = %s; cv_free(_ret); _ret = cv_retain(_rv); cv_free(_rv); goto _cleanup; }\n", e); g->used_cleanup = 1; }
+            else fprintf(g->out, "    { CoVal _rv = %s; cv_free(_rv); return 0; }\n", e);
+            free(e);
+        } else {
+            if (g->in_func) { fprintf(g->out, "    goto _cleanup;\n"); g->used_cleanup = 1; }
+            else fprintf(g->out, "    return 0;\n");
+        }
+        break;
+    }
+    case ND_BREAK:    fprintf(g->out, "    break;\n"); break;
+    case ND_CONTINUE: fprintf(g->out, "    continue;\n"); break;
+    case ND_FUNC_DEF: ng_error(g, n, "原生编译仅支持顶层函数定义（不支持嵌套函数）"); break;
+    case ND_BINARY: case ND_UNARY: case ND_LITERAL: case ND_IDENT: case ND_FUNC_CALL: {
+        char *e = ng_expr(g, n);
+        fprintf(g->out, "    cv_free(%s);\n", e);
+        free(e);
+        break;
+    }
+    default:
+        ng_error(g, n, "原生编译暂不支持的语句节点(类型 %d)", n->type);
+    }
+}
+
+/* 如果/否则若/否则：用嵌套 else-if 精确还原短路与「只执行一个分支」语义 */
+static void ng_if_branch(NGen *g, Node *n, int b);
+static void ng_if_chain(NGen *g, Node *n, int b) {
+    if (b == 0) {
+        char *c = ng_expr(g, n->if_stmt.cond);
+        fprintf(g->out, "    { CoVal _c = %s; int _ct = cv_truthy(_c); cv_free(_c);\n", c);
+        free(c);
+        fprintf(g->out, "      if (_ct) {\n");
+        for (int i = 0; i < n->if_stmt.tcnt; i++) ng_stmt(g, n->if_stmt.then_body[i]);
+        fprintf(g->out, "      } else {\n");
+        if (n->if_stmt.br_cnt > 0) ng_if_branch(g, n, 0);
+        fprintf(g->out, "      }\n");
+        fprintf(g->out, "    }\n");
+        return;
+    }
+}
+static void ng_if_branch(NGen *g, Node *n, int b) {
+    ElseBranch *br = &n->if_stmt.else_branches[b];
+    if (br->is_else) {
+        for (int i = 0; i < br->bcnt; i++) ng_stmt(g, br->body[i]);
+        return;
+    }
+    char *ec = ng_expr(g, br->cond);
+    fprintf(g->out, "      CoVal _ec = %s; int _et = cv_truthy(_ec); cv_free(_ec);\n", ec);
+    free(ec);
+    fprintf(g->out, "      if (_et) {\n");
+    for (int i = 0; i < br->bcnt; i++) ng_stmt(g, br->body[i]);
+    fprintf(g->out, "      } else {\n");
+    if (b + 1 < n->if_stmt.br_cnt) ng_if_branch(g, n, b + 1);
+    fprintf(g->out, "      }\n");
+}
+
+static void ng_while(NGen *g, Node *n) {
+    fprintf(g->out, "    for (;;) {\n");
+    char *c = ng_expr(g, n->while_stmt.cond);
+    fprintf(g->out, "      CoVal _c = %s; int _ct = cv_truthy(_c); cv_free(_c);\n", c);
+    free(c);
+    fprintf(g->out, "      if (!_ct) break;\n");
+    for (int i = 0; i < n->while_stmt.bcnt; i++) ng_stmt(g, n->while_stmt.body[i]);
+    fprintf(g->out, "    }\n");
+}
+
+static void ng_for(NGen *g, Node *n) {
+    fprintf(g->out, "    {\n");
+    char *s = ng_expr(g, n->for_stmt.start);
+    char *e = ng_expr(g, n->for_stmt.end);
+    fprintf(g->out, "      CoVal _s = %s, _e = %s;\n", s, e);
+    free(s); free(e);
+    fprintf(g->out, "      double _sv = cv_num(_s), _ev = cv_num(_e);\n");
+    fprintf(g->out, "      double _stp = 1.0; int _sf = 0;\n");
+    if (n->for_stmt.step) {
+        char *st = ng_expr(g, n->for_stmt.step);
+        fprintf(g->out, "      { CoVal _st = %s; _stp = cv_num(_st); _sf = (_st.tag == CV_FLT); cv_free(_st); }\n", st);
+        free(st);
+    }
+    fprintf(g->out, "      int _isf = (_s.tag == CV_FLT || _e.tag == CV_FLT || _sf);\n");
+    fprintf(g->out, "      cv_free(_s); cv_free(_e);\n");
+    fprintf(g->out, "      if (_stp == 0) cv_die(\"循环步长不能为 0\");\n");
+    fprintf(g->out, "      double _i = _sv; int _dir = (_stp > 0) ? 1 : -1;\n");
+    /* 步进【必须】放在 for 的第三段，不能放在循环体末尾：
+       放末尾时 `继续`（C 的 continue）会跳过步进，直接变成死循环。
+       这正是「嵌套控制流」用例暴露出来的问题。 */
+    fprintf(g->out, "      for (; (_dir > 0 && _i <= _ev + 1e-4) || (_dir < 0 && _i >= _ev - 1e-4); _i += _stp) {\n");
+    char *lv = ng_local(g, n->for_stmt.var);
+    fprintf(g->out, "        cv_free(%s); %s = _isf ? cv_flt(_i) : cv_int((long)_i);\n", lv, lv);
+    for (int i = 0; i < n->for_stmt.bcnt; i++) ng_stmt(g, n->for_stmt.body[i]);
+    fprintf(g->out, "      }\n");
+    fprintf(g->out, "    }\n");
+}
+
+/* 收集函数体内所有需声明的局部名（变量声明 + 循环变量 + 参数） */
+static void ng_collect(NGen *g, Node *n) {
+    if (!n) return;
+    switch (n->type) {
+    case ND_PROGRAM:
+        for (int i = 0; i < n->prog.cnt; i++) ng_collect(g, n->prog.stmts[i]);
+        break;
+    case ND_VAR_DECL: ng_local(g, n->var_decl.name); break;
+    case ND_IF:
+        ng_collect(g, n->if_stmt.cond);
+        for (int i = 0; i < n->if_stmt.tcnt; i++) ng_collect(g, n->if_stmt.then_body[i]);
+        for (int b = 0; b < n->if_stmt.br_cnt; b++) {
+            ElseBranch *br = &n->if_stmt.else_branches[b];
+            if (br->cond) ng_collect(g, br->cond);
+            for (int i = 0; i < br->bcnt; i++) ng_collect(g, br->body[i]);
+        }
+        break;
+    case ND_WHILE:
+        ng_collect(g, n->while_stmt.cond);
+        for (int i = 0; i < n->while_stmt.bcnt; i++) ng_collect(g, n->while_stmt.body[i]);
+        break;
+    case ND_FOR:
+        ng_collect(g, n->for_stmt.start); ng_collect(g, n->for_stmt.end);
+        if (n->for_stmt.step) ng_collect(g, n->for_stmt.step);
+        ng_local(g, n->for_stmt.var);
+        for (int i = 0; i < n->for_stmt.bcnt; i++) ng_collect(g, n->for_stmt.body[i]);
+        break;
+    case ND_FUNC_DEF: ng_error(g, n, "不支持嵌套函数定义"); break;
+    case ND_RETURN: if (n->ret_stmt.val) ng_collect(g, n->ret_stmt.val); break;
+    case ND_ASSIGN: if (n->assign.val) ng_collect(g, n->assign.val); break;
+    case ND_BINARY: ng_collect(g, n->binary.left); ng_collect(g, n->binary.right); break;
+    case ND_UNARY: ng_collect(g, n->unary.operand); break;
+    case ND_FUNC_CALL:
+        for (int i = 0; i < n->func_call.acnt; i++) ng_collect(g, n->func_call.args[i]);
+        break;
+    default: break;
+    }
+}
+
+static void ng_function(NGen *g, Node *n) {
+    char *fc = ng_register_func(g, n->func_def.name, n->func_def.pcnt);
+    g->in_func = 1;
+    g->l_n = 0; g->cl_n = 0; g->cleanup_n = 0; g->used_cleanup = 0;
+    ng_collect(g, n->func_def.body);
+    fprintf(g->out, "/* coCN 函数: %s（%d 个参数） */\n", n->func_def.name, n->func_def.pcnt);
+    fprintf(g->out, "static CoVal %s(CoVal *_p, int _n) {\n", fc);
+    /* 实参个数必须在【绑定形参之前】校验：先 cv_retain(_p[i]) 再检查个数，
+       等于在越界内存上读一遍，是实打实的未定义行为。 */
+    fprintf(g->out, "    if (_n != %d) cv_die(\"函数 %s 需要 %d 个参数，收到 %%d 个\", _n);\n",
+            n->func_def.pcnt, n->func_def.name, n->func_def.pcnt);
+    /* 零参函数不会读 _p，-Wunused-parameter 会报警。生成的代码同样要求零警告，
+       否则使用者把 --生成C 的产物接进自己的构建时会被噪音淹没。 */
+    if (n->func_def.pcnt == 0) fprintf(g->out, "    (void)_p;\n");
+    for (int i = 0; i < n->func_def.pcnt; i++) {
+        char *c = ng_local(g, n->func_def.pnames[i]);
+        g->cl_names[g->cl_n] = strdup(n->func_def.pnames[i]);
+        g->cl_cnames[g->cl_n] = strdup(c); g->cl_n++;
+        fprintf(g->out, "    CoVal %s = cv_retain(_p[%d]);  /* 形参: %s */\n",
+                c, i, n->func_def.pnames[i]);
+    }
+    for (int i = 0; i < g->l_n; i++) {
+        int isparam = 0;
+        for (int j = 0; j < g->cl_n; j++) if (strcmp(g->cl_names[j], g->l_names[i]) == 0) { isparam = 1; break; }
+        if (isparam) continue;
+        fprintf(g->out, "    CoVal %s = cv_null();\n", g->l_cnames[i]);
+        g->cleanup[g->cleanup_n++] = g->l_cnames[i];
+    }
+    for (int i = 0; i < g->cl_n; i++) g->cleanup[g->cleanup_n++] = g->cl_cnames[i];
+    fprintf(g->out, "    CoVal _ret = cv_null();\n");
+    for (int i = 0; i < n->func_def.body->prog.cnt; i++) ng_stmt(g, n->func_def.body->prog.stmts[i]);
+    /* 没有任何 返回 语句的函数不会跳到 _cleanup，此时发标签会触发 -Wunused-label */
+    if (g->used_cleanup) fprintf(g->out, "    _cleanup:\n");
+    for (int i = 0; i < g->cleanup_n; i++) fprintf(g->out, "    cv_free(%s);\n", g->cleanup[i]);
+    fprintf(g->out, "    return _ret;\n}\n\n");
+    g->in_func = 0;
+}
+
+/* 运行时头：自包含，无解释器依赖 */
+static void ng_emit_runtime(FILE *out) {
+    fputs("/* coCN 原生编译产物（由 co --生成C 自动生成，请勿手改） */\n", out);
+    fputs("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n#include <stdarg.h>\n#include <ctype.h>\n#include <sys/time.h>\n", out);
+    /* 运行时是【完整的】：脚本没用到的内置照样发射，方便 --生成C 产物被人
+       二次修改与复用。但这会让 -Wunused-function 报一堆噪音，所以统一标注。 */
+    fputs("#if defined(__GNUC__) || defined(__clang__)\n#  define CV_UNUSED __attribute__((unused))\n#else\n#  define CV_UNUSED\n#endif\n", out);
+    fputs("typedef struct { int tag; long i; double f; char *s; int *rc; } CoVal;\n", out);
+    fputs("#define CV_NULL 0\n#define CV_INT 1\n#define CV_FLT 2\n#define CV_BOOL 3\n#define CV_STR 4\n", out);
+    fputs("static CV_UNUSED CoVal cv_int(long x){ CoVal v; v.tag=CV_INT; v.i=x; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_flt(double x){ CoVal v; v.tag=CV_FLT; v.f=x; v.i=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_bool(int x){ CoVal v; v.tag=CV_BOOL; v.i=x?1:0; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_null(void){ CoVal v; v.tag=CV_NULL; v.i=0; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
+    fputs("static CV_UNUSED void cv_die(const char *msg, ...){\n", out);
+    fputs("    va_list ap; va_start(ap,msg);\n", out);
+    fputs("    fprintf(stderr,\"运行错误: \"); vfprintf(stderr,msg,ap); fprintf(stderr,\"\\n\"); va_end(ap); exit(1);\n", out);
+    fputs("}\n", out);
+    fputs("static CV_UNUSED char *cv_str_dup(const char *s){ size_t n=s?strlen(s):0; char *p=(char*)malloc(n+1); if(!p) cv_die(\"内存不足\"); if(s) memcpy(p,s,n); p[n]=0; return p; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_str_take(char *s){ CoVal v; v.tag=CV_STR; v.i=0; v.f=0; v.s=s; v.rc=(int*)malloc(sizeof(int)); if(!v.rc) cv_die(\"内存不足\"); *(v.rc)=1; return v; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_str_dupv(const char *s){ return cv_str_take(cv_str_dup(s)); }\n", out);
+    fputs("static CV_UNUSED void cv_free(CoVal v){ if(v.tag==CV_STR && v.s){ if(v.rc){ if(--(*v.rc)<=0){ free(v.s); free(v.rc); } } } }\n", out);
+    fputs("static CV_UNUSED CoVal cv_retain(CoVal v){ if(v.tag==CV_STR && v.rc) (*v.rc)++; return v; }\n", out);
+    fputs("static CV_UNUSED int cv_truthy(CoVal v){\n", out);
+    fputs("    switch(v.tag){ case CV_NULL: return 0; case CV_INT: return v.i!=0; case CV_FLT: return (v.f!=0.0)&&!isnan(v.f); case CV_BOOL: return v.i!=0; case CV_STR: return v.s&&v.s[0]!='\\0'; default: return 0; }\n", out);
+    fputs("}\n", out);
+    fputs("static CV_UNUSED int cv_isnum(CoVal v){ return v.tag==CV_INT||v.tag==CV_FLT||v.tag==CV_BOOL; }\n", out);
+    fputs("static CV_UNUSED double cv_num(CoVal v){ if(v.tag==CV_INT) return (double)v.i; if(v.tag==CV_FLT) return v.f; if(v.tag==CV_BOOL) return (double)v.i; cv_die(\"需要数值，收到非数值类型\"); return 0; }\n", out);
+    fputs("static CV_UNUSED char *cv_to_string(CoVal v){ char buf[64];\n", out);
+    fputs("    switch(v.tag){ case CV_NULL: return cv_str_dup(\"空\"); case CV_BOOL: return cv_str_dup(v.i?\"真\":\"假\");\n", out);
+    fputs("      case CV_INT: snprintf(buf,sizeof(buf),\"%ld\",v.i); return cv_str_dup(buf);\n", out);
+    fputs("      case CV_FLT: snprintf(buf,sizeof(buf),\"%g\",v.f); return cv_str_dup(buf);\n", out);
+    fputs("      case CV_STR: return cv_str_dup(v.s?v.s:\"\"); default: return cv_str_dup(\"<未知>\"); } }\n", out);
+    fputs("static CV_UNUSED int cv_eq(CoVal a, CoVal b){\n", out);
+    fputs("    if(a.tag==b.tag){ if(a.tag==CV_INT||a.tag==CV_BOOL) return a.i==b.i; if(a.tag==CV_FLT) return a.f==b.f; if(a.tag==CV_STR) return (a.s&&b.s)?(strcmp(a.s,b.s)==0):(a.s==b.s); if(a.tag==CV_NULL) return 1; }\n", out);
+    fputs("    if(cv_isnum(a)&&cv_isnum(b)) return cv_num(a)==cv_num(b);\n", out);
+    fputs("    return 0;\n}\n", out);
+    fputs("static CV_UNUSED int cv_cmp(CoVal a, CoVal b){\n", out);
+    fputs("    if(cv_isnum(a)&&cv_isnum(b)){ double x=cv_num(a),y=cv_num(b); return x<y?-1:(x>y?1:0); }\n", out);
+    fputs("    if(a.tag==CV_STR&&b.tag==CV_STR) return strcmp(a.s?a.s:\"\", b.s?b.s:\"\");\n", out);
+    fputs("    cv_die(\"无法比较大小\"); return 0;\n}\n", out);
+    fputs("static CV_UNUSED CoVal cv_unary_neg(CoVal v){ if(v.tag==CV_INT) return cv_int(-v.i); if(v.tag==CV_FLT) return cv_flt(-v.f); if(v.tag==CV_BOOL) return cv_int(-v.i); cv_die(\"取负需要数字或布尔\"); return cv_null(); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_unary_bnot(CoVal v){ if(v.tag==CV_INT||v.tag==CV_BOOL) return cv_int(~v.i); cv_die(\"按位取反需要整数，收到非整数（浮点请先用 取整 转换）\"); return cv_null(); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_bin(CoVal L, const char *op, CoVal R){\n", out);
+    fputs("    if(strcmp(op,\"==\")==0){ int e=cv_eq(L,R); cv_free(L); cv_free(R); return cv_bool(e); }\n", out);
+    fputs("    if(strcmp(op,\"!=\")==0){ int e=cv_eq(L,R); cv_free(L); cv_free(R); return cv_bool(!e); }\n", out);
+    fputs("    if(strcmp(op,\"<\")==0){ int c=cv_cmp(L,R); cv_free(L); cv_free(R); return cv_bool(c<0); }\n", out);
+    fputs("    if(strcmp(op,\">\")==0){ int c=cv_cmp(L,R); cv_free(L); cv_free(R); return cv_bool(c>0); }\n", out);
+    fputs("    if(strcmp(op,\"<=\")==0){ int c=cv_cmp(L,R); cv_free(L); cv_free(R); return cv_bool(c<=0); }\n", out);
+    fputs("    if(strcmp(op,\">=\")==0){ int c=cv_cmp(L,R); cv_free(L); cv_free(R); return cv_bool(c>=0); }\n", out);
+    fputs("    if(strcmp(op,\"&\")==0||strcmp(op,\"|\")==0||strcmp(op,\"^\")==0||strcmp(op,\"<<\")==0||strcmp(op,\">>\")==0){\n", out);
+    fputs("        if(!((L.tag==CV_INT||L.tag==CV_BOOL)&&(R.tag==CV_INT||R.tag==CV_BOOL))) cv_die(\"位运算 %s 需要整数\", op);\n", out);
+    fputs("        long a=L.i,b=R.i,res=0;\n", out);
+    fputs("        if(strcmp(op,\"<<\")==0||strcmp(op,\">>\")==0){ if(b<0) cv_die(\"移位位数不能为负: %ld\",b); if(b>63) cv_die(\"移位位数超出范围: %ld（0~63）\",b);\n", out);
+    fputs("            if(strcmp(op,\"<<\")==0) res=(long)((unsigned long)a<<(unsigned)b);\n", out);
+    fputs("            else res=(a<0)?(long)~((~(unsigned long)a)>>(unsigned)b):(long)((unsigned long)a>>(unsigned)b);\n", out);
+    fputs("        } else if(strcmp(op,\"&\")==0) res=a&b; else if(strcmp(op,\"|\")==0) res=a|b; else res=a^b;\n", out);
+    fputs("        cv_free(L); cv_free(R); return cv_int(res);\n", out);
+    fputs("    }\n", out);
+    fputs("    if(L.tag==CV_STR||R.tag==CV_STR){\n", out);
+    fputs("        if(strcmp(op,\"+\")!=0) cv_die(\"字符串只支持 + 拼接，不支持 %s\", op);\n", out);
+    fputs("        char *ls=cv_to_string(L), *rs=cv_to_string(R); size_t nl=strlen(ls)+strlen(rs)+1; char *o=(char*)malloc(nl); if(!o) cv_die(\"内存不足\"); snprintf(o,nl,\"%s%s\",ls,rs); free(ls); free(rs); cv_free(L); cv_free(R); return cv_str_take(o);\n", out);
+    fputs("    }\n", out);
+    fputs("    if(!cv_isnum(L)||!cv_isnum(R)) cv_die(\"不支持的运算：操作数类型不兼容\");\n", out);
+    fputs("    double l=cv_num(L), r=cv_num(R), x=0; int isf=(L.tag==CV_FLT||R.tag==CV_FLT);\n", out);
+    fputs("    if(strcmp(op,\"+\")==0) x=l+r; else if(strcmp(op,\"-\")==0) x=l-r; else if(strcmp(op,\"*\")==0) x=l*r;\n", out);
+    fputs("    else if(strcmp(op,\"/\")==0){ if(r==0) cv_die(\"除以零\"); x=l/r; isf=1; }\n", out);
+    fputs("    else if(strcmp(op,\"//\")==0){ if(r==0) cv_die(\"整除的除数为零\"); x=floor(l/r); }\n", out);
+    /* 用的是 fputs（不做格式展开），取模运算符必须写成单个 %；
+       写成 %% 会被原样发射进生成代码，导致运行期报「无效的二元运算符: %」。 */
+    fputs("    else if(strcmp(op,\"%\")==0){ if(r==0) cv_die(\"取模的除数为零\"); x=fmod(l,r); }\n", out);
+    fputs("    else cv_die(\"无效的二元运算符: %s\", op);\n", out);
+    fputs("    cv_free(L); cv_free(R); if(isf) return cv_flt(x); return cv_int((long)x);\n", out);
+    fputs("}\n", out);
+    fputs("static CV_UNUSED long cv_utf8_len(const char *s){ if(!s) return 0; long c=0; while(*s){ if(((*s)&0xC0)!=0x80) c++; s++; } return c; }\n", out);
+    fputs("static CV_UNUSED int cv_utf8_char(const char *s, long ci, char *out){ out[0]=0; if(!s) return 0; long c=0; const char *p=s;\n", out);
+    fputs("    while(*p){ int start=(((*p)&0xC0)!=0x80); if(start){ if(c==ci){ unsigned char b=(unsigned char)*p; int n=1; if((b&0xE0)==0xC0)n=2; else if((b&0xF0)==0xE0)n=3; else if((b&0xF8)==0xF0)n=4; int k=0; while(k<n&&p[k]){ out[k]=(char)p[k]; k++; } out[k]=0; return k; } c++; } p++; } return 0; }\n", out);
+    /* 内置函数 */
+    fputs("static CV_UNUSED CoVal cv_b_print(CoVal *a, int n){ for(int i=0;i<n;i++){ char *s=cv_to_string(a[i]); printf(\"%s\",s); free(s); if(i<n-1) printf(\" \"); } printf(\"\\n\"); return cv_null(); }\n", out);
+    /* 输出错误：与解释器 builtin_eprint 逐字对齐，写 stderr 而非 stdout */
+    fputs("static CV_UNUSED CoVal cv_b_eprint(CoVal *a, int n){ for(int i=0;i<n;i++){ char *s=cv_to_string(a[i]); fprintf(stderr,\"%s\",s); free(s); if(i<n-1) fprintf(stderr,\" \"); } fprintf(stderr,\"\\n\"); return cv_null(); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_assert(CoVal *a, int n){ if(!cv_truthy(a[0])){ const char *m=(n>=2&&a[1].tag==CV_STR)?a[1].s:\"（无说明）\"; fprintf(stderr,\"断言失败: %s\\n\", m?m:\"\"); exit(1); } return cv_null(); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_assert_eq(CoVal *a, int n){ if(!cv_eq(a[0],a[1])){ char *s0=cv_to_string(a[0]), *s1=cv_to_string(a[1]); const char *m=(n>=3&&a[2].tag==CV_STR)?a[2].s:NULL; fprintf(stderr,\"断言失败: %s == %s（%s）\\n\", s0, s1, m?m:\"\"); free(s0); free(s1); exit(1); } return cv_null(); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_str(CoVal *a, int n){ (void)n; char *s=cv_to_string(a[0]); return cv_str_take(s); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_int(CoVal *a, int n){ (void)n; CoVal v=a[0]; if(v.tag==CV_INT) return cv_int(v.i); if(v.tag==CV_BOOL) return cv_int(v.i?1:0); if(v.tag==CV_FLT) return cv_int((long)v.f); if(v.tag==CV_STR) return cv_int(strtol(v.s,NULL,10)); return cv_int(0); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_flt(CoVal *a, int n){ (void)n; CoVal v=a[0]; if(v.tag==CV_INT||v.tag==CV_BOOL) return cv_flt((double)v.i); if(v.tag==CV_FLT) return cv_flt(v.f); if(v.tag==CV_STR) return cv_flt(strtod(v.s,NULL)); return cv_flt(0); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_bool(CoVal *a, int n){ (void)n; return cv_bool(cv_truthy(a[0])); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_round(CoVal *a, int n){ (void)n; return cv_int((long)llround(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_floor(CoVal *a, int n){ (void)n; return cv_int((long)floor(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_ceil(CoVal *a, int n){ (void)n; return cv_int((long)ceil(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_trunc(CoVal *a, int n){ (void)n; return cv_int((long)trunc(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_len(CoVal *a, int n){ (void)n; if(a[0].tag!=CV_STR) return cv_int(1); const char *s=a[0].s; long c=0; while(*s){ if(((*s)&0xC0)!=0x80) c++; s++; } return cv_int(c); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_type(CoVal *a, int n){ (void)n; switch(a[0].tag){ case CV_NULL: return cv_str_dupv(\"空\"); case CV_BOOL: return cv_str_dupv(\"布尔\"); case CV_INT: return cv_str_dupv(\"整数\"); case CV_FLT: return cv_str_dupv(\"浮点\"); case CV_STR: return cv_str_dupv(\"字符串\"); default: return cv_str_dupv(\"未知\"); } }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_abs(CoVal *a, int n){ (void)n; if(a[0].tag==CV_INT) return cv_int(llabs(a[0].i)); return cv_flt(fabs(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_sign(CoVal *a, int n){ (void)n; double x=cv_num(a[0]); return cv_int(x>0?1:(x<0?-1:0)); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_pow(CoVal *a, int n){ (void)n; return cv_flt(pow(cv_num(a[0]),cv_num(a[1]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_sqrt(CoVal *a, int n){ (void)n; return cv_flt(sqrt(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_ln(CoVal *a, int n){ (void)n; return cv_flt(log(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_sin(CoVal *a, int n){ (void)n; return cv_flt(sin(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_cos(CoVal *a, int n){ (void)n; return cv_flt(cos(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_tan(CoVal *a, int n){ (void)n; return cv_flt(tan(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_pi(CoVal *a, int n){ (void)a; (void)n; return cv_flt(3.14159265358979323846); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_max(CoVal *a, int n){ (void)n; int c; if(a[0].tag==CV_STR&&a[1].tag==CV_STR) c=strcmp(a[0].s?a[0].s:\"\",a[1].s?a[1].s:\"\"); else c=cv_cmp(a[0],a[1]); return cv_retain(c>=0?a[0]:a[1]); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_min(CoVal *a, int n){ (void)n; int c; if(a[0].tag==CV_STR&&a[1].tag==CV_STR) c=strcmp(a[0].s?a[0].s:\"\",a[1].s?a[1].s:\"\"); else c=cv_cmp(a[0],a[1]); return cv_retain(c<=0?a[0]:a[1]); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_hex(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"十六进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; const char *t=\"0123456789abcdef\"; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)t[u%16]; u/=16; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='x'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_bin(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"二进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)('0'+(int)(u&1ULL)); u>>=1; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='b'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_oct(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"八进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)('0'+(int)(u%8ULL)); u/=8; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='o'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_popcount(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int c=0; while(u){ u&=u-1; c++; } return cv_int((long)c); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_getbit(CoVal *a, int n){ (void)n; long b=cv_num(a[1]); if(b<0||b>63) cv_die(\"取位 位号须在 0~63 之间: %ld\",b); unsigned long long u=(unsigned long long)a[0].i; return cv_int((long)((u>>b)&1ULL)); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_setbit(CoVal *a, int n){ (void)n; long b=cv_num(a[1]); if(b<0||b>63) cv_die(\"置位 位号须在 0~63 之间: %ld\",b); long bit=cv_num(a[2]); if(bit!=0&&bit!=1) cv_die(\"置位 目标值只能是 0 或 1: %ld\",bit); unsigned long long u=(unsigned long long)a[0].i; if(bit) u|=(1ULL<<b); else u&=~(1ULL<<b); return cv_int((long)u); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_bytelen(CoVal *a, int n){ (void)n; const char *s=a[0].tag==CV_STR?a[0].s:\"\"; return cv_int((long)strlen(s)); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_byteat(CoVal *a, int n){ (void)n; const char *s=a[0].tag==CV_STR?a[0].s:\"\"; long nn=(long)strlen(s); long i=cv_num(a[1]); if(i<0) i+=nn; if(i<0||i>=nn) cv_die(\"字节 下标越界: %ld（共 %ld 字节）\", i, nn); return cv_int((long)(unsigned char)s[i]); }\n", out);
+    /* 字符串处理：与解释器逐字对齐（大小写只动 ASCII 以免破坏 UTF-8；
+       查找/截取一律按【字符】坐标，与 长度/下标 同一坐标系）。 */
+    fputs("static CV_UNUSED const char *cv_sarg(CoVal v, const char *who){ if(v.tag!=CV_STR) cv_die(\"%s 需要字符串参数\", who); return v.s?v.s:\"\"; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_case(const char *s, int up){ char *p=cv_str_dup(s); for(char *q=p;*q;q++){ unsigned char c=(unsigned char)*q; if(c<0x80) *q = up ? (char)toupper(c) : (char)tolower(c); } return cv_str_take(p); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_upper(CoVal *a, int n){ (void)n; return cv_case(cv_sarg(a[0],\"大写\"),1); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_lower(CoVal *a, int n){ (void)n; return cv_case(cv_sarg(a[0],\"小写\"),0); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_trim(const char *s, int L, int R){ const char *b=s, *e=s+strlen(s); if(L) while(b<e&&(unsigned char)*b<=' ') b++; if(R) while(e>b&&(unsigned char)*(e-1)<=' ') e--; size_t k=(size_t)(e-b); char *p=(char*)malloc(k+1); if(!p) cv_die(\"内存不足\"); memcpy(p,b,k); p[k]=0; return cv_str_take(p); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_strip(CoVal *a, int n){ (void)n; return cv_trim(cv_sarg(a[0],\"去空白\"),1,1); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_lstrip(CoVal *a, int n){ (void)n; return cv_trim(cv_sarg(a[0],\"去左空白\"),1,0); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_rstrip(CoVal *a, int n){ (void)n; return cv_trim(cv_sarg(a[0],\"去右空白\"),0,1); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_repeat(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"重复\"); long k=(long)cv_num(a[1]); if(k<0) cv_die(\"重复次数不能为负数\"); size_t sl=strlen(s); if(k&&sl>((size_t)-1-1)/(size_t)k) cv_die(\"重复结果过长\"); size_t tot=sl*(size_t)k; char *p=(char*)malloc(tot+1); if(!p) cv_die(\"内存不足\"); for(long i=0;i<k;i++) memcpy(p+(size_t)i*sl,s,sl); p[tot]=0; return cv_str_take(p); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_startswith(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"开头是\"), *p=cv_sarg(a[1],\"开头是\"); return cv_bool(strncmp(s,p,strlen(p))==0); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_endswith(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"结尾是\"), *p=cv_sarg(a[1],\"结尾是\"); size_t ls=strlen(s), lp=strlen(p); return cv_bool(lp<=ls && strcmp(s+ls-lp,p)==0); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_ord(CoVal *a, int n){ const char *s=cv_sarg(a[0],\"字符码\"); long idx=(n>=2)?(long)cv_num(a[1]):0; char cb[8]; if(!cv_utf8_char(s,idx,cb)) cv_die(\"字符码的下标越界\"); unsigned char c0=(unsigned char)cb[0]; int k=1; if((c0&0xE0)==0xC0)k=2; else if((c0&0xF0)==0xE0)k=3; else if((c0&0xF8)==0xF0)k=4; long cp; if(k==1) cp=c0; else if(k==2) cp=((long)(c0&0x1F)<<6)|((unsigned char)cb[1]&0x3F); else if(k==3) cp=((long)(c0&0x0F)<<12)|(((unsigned char)cb[1]&0x3F)<<6)|((unsigned char)cb[2]&0x3F); else cp=((long)(c0&0x07)<<18)|(((long)((unsigned char)cb[1]&0x3F))<<12)|(((long)((unsigned char)cb[2]&0x3F))<<6)|((unsigned char)cb[3]&0x3F); return cv_int(cp); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_chr(CoVal *a, int n){ (void)n; long cp=(long)cv_num(a[0]); if(cp<0||cp>0x10FFFF) cv_die(\"码点超出 Unicode 范围\"); char b[5]; int k; if(cp<0x80){ b[0]=(char)cp; k=1; } else if(cp<0x800){ b[0]=(char)(0xC0|(cp>>6)); b[1]=(char)(0x80|(cp&0x3F)); k=2; } else if(cp<0x10000){ b[0]=(char)(0xE0|(cp>>12)); b[1]=(char)(0x80|((cp>>6)&0x3F)); b[2]=(char)(0x80|(cp&0x3F)); k=3; } else { b[0]=(char)(0xF0|(cp>>18)); b[1]=(char)(0x80|((cp>>12)&0x3F)); b[2]=(char)(0x80|((cp>>6)&0x3F)); b[3]=(char)(0x80|(cp&0x3F)); k=4; } b[k]=0; return cv_str_dupv(b); }\n", out);
+    fputs("static CV_UNUSED long cv_utf8_off(const char *s, long ci){ long c=0; const char *p=s; while(*p){ if(c==ci) return (long)(p-s); unsigned char b=(unsigned char)*p; int k=1; if((b&0xE0)==0xC0)k=2; else if((b&0xF0)==0xE0)k=3; else if((b&0xF8)==0xF0)k=4; p+=k; c++; } return (c==ci)?(long)(p-s):-1; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_substr(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"截取\"); if(a[1].tag!=CV_INT||a[2].tag!=CV_INT) cv_die(\"截取函数的后两个参数必须是整数\"); long st=a[1].i, cnt=a[2].i, tot=cv_utf8_len(s); if(st<0) st+=tot; if(st<0) st=0; if(st>tot) st=tot; if(cnt<0) cnt=0; if(st+cnt>tot) cnt=tot-st; long b0=cv_utf8_off(s,st), b1=cv_utf8_off(s,st+cnt); if(b0<0) b0=0; if(b1<0) b1=(long)strlen(s); long nb=b1-b0; char *p=(char*)malloc((size_t)nb+1); if(!p) cv_die(\"内存不足\"); memcpy(p,s+b0,(size_t)nb); p[nb]=0; return cv_str_take(p); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_find(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"查找\"), *t=cv_sarg(a[1],\"查找\"); const char *p=strstr(s,t); if(!p) return cv_int(-1); long c=0; for(const char *q=s;*q&&q<p;){ unsigned char b=(unsigned char)*q; int k=1; if((b&0xE0)==0xC0)k=2; else if((b&0xF0)==0xE0)k=3; else if((b&0xF8)==0xF0)k=4; q+=k; c++; } return cv_int(c); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_replace(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"替换\"), *o=cv_sarg(a[1],\"替换\"), *r=cv_sarg(a[2],\"替换\"); size_t ol=strlen(o); if(ol==0) cv_die(\"替换函数的被替换串不能为空\"); size_t rl=strlen(r), cap=strlen(s)+16, len=0; char *buf=(char*)malloc(cap); if(!buf) cv_die(\"内存不足\"); const char *p=s; while(*p){ const char *seg; size_t sl; if(strncmp(p,o,ol)==0){ seg=r; sl=rl; p+=ol; } else { seg=p; sl=1; p++; } if(len+sl+1>cap){ while(len+sl+1>cap) cap*=2; buf=(char*)realloc(buf,cap); if(!buf) cv_die(\"内存不足\"); } memcpy(buf+len,seg,sl); len+=sl; } buf[len]=0; return cv_str_take(buf); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_clock(CoVal *a, int n){ (void)a; (void)n; struct timeval tv; gettimeofday(&tv,NULL); return cv_flt((double)tv.tv_sec+(double)tv.tv_usec/1000000.0); }\n", out);
+    fputs("\n", out);
+}
+
+static int compile_program_to_c(Node *prog, const char *outpath) {
+    FILE *out = fopen(outpath, "w");
+    if (!out) { fprintf(stderr, "无法打开输出文件: %s\n", outpath); return 1; }
+    NGen gg; memset(&gg, 0, sizeof gg); gg.out = out;
+    /* 第一遍：注册全局变量与函数。
+       必须递归下钻——`如果`/`当`/`对于` 的体内声明的变量、以及 `对于` 的
+       循环变量都属于顶层作用域；只扫顶层 ND_VAR_DECL 会漏掉它们，
+       导致第二遍生成 `g16 = ...` 却没有对应的 `static CoVal g16;`。
+       函数定义单独注册（ng_collect 遇到嵌套函数会直接报错）。 */
+    gg.in_func = 0;
+    for (int i = 0; i < prog->prog.cnt; i++) {
+        Node *s = prog->prog.stmts[i];
+        if (s->type == ND_FUNC_DEF) ng_register_func(&gg, s->func_def.name, s->func_def.pcnt);
+        else ng_collect(&gg, s);
+    }
+    ng_emit_runtime(out);
+    /* 全局变量必须用【常量】初始化：静态存储期对象不允许调函数。
+       这里直接展开 cv_null() 的字面值，与 CoVal 字段顺序一一对应。 */
+    for (int i = 0; i < gg.g_n; i++)
+        fprintf(out, "static CoVal %s = { CV_NULL, 0, 0.0, NULL, NULL };  /* 原名: %s */\n",
+                gg.g_cnames[i], gg.g_names[i]);
+    fprintf(out, "\n");
+    for (int i = 0; i < gg.f_n; i++) fprintf(out, "static CoVal %s(CoVal *, int);\n", gg.f_cnames[i]);
+    fprintf(out, "\n");
+    for (int i = 0; i < prog->prog.cnt; i++) {
+        Node *s = prog->prog.stmts[i];
+        if (s->type == ND_FUNC_DEF) ng_function(&gg, s);
+    }
+    fprintf(out, "int main(int argc, char **argv) {\n  (void)argc; (void)argv;\n");
+    for (int i = 0; i < prog->prog.cnt; i++) {
+        Node *s = prog->prog.stmts[i];
+        if (s->type == ND_FUNC_DEF) continue;
+        gg.in_func = 0;
+        ng_stmt(&gg, s);
+    }
+    fprintf(out, "  return 0;\n}\n");
+    fclose(out);
+    return 0;
+}
+
+static void derive_out(const char *in, const char *suffix, char *dst, size_t n) {
+    size_t len = strlen(in);
+    if (len >= 3 && strcmp(in + len - 3, ".co") == 0) len -= 3;
+    snprintf(dst, n, "%.*s%s", (int)len, in, suffix);
+}
+
+/* 处理 --生成C / --编译：读取、解析、转译、编译 */
+static int do_compile(const char *mode, const char *infile, const char *outarg) {
+    FILE *f = fopen(infile, "r");
+    if (!f) { fprintf(stderr, "错误: 无法打开文件 '%s'\n", infile); return 1; }
+    fseek(f, 0, SEEK_END); long size = ftell(f);
+    if (size < 0) { fclose(f); return 1; }
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(size + 1);
+    if (!buf) { fclose(f); return 1; }
+    if (fread(buf, 1, size, f) != (size_t)size) { fprintf(stderr, "读取不完整\n"); free(buf); fclose(f); return 1; }
+    buf[size] = 0; fclose(f);
+
+    src = buf; src_pos = 0; src_line = 1; src_col = 1; advance();
+    Node *prog = parse_program();
+
+    if (strcmp(mode, "--生成C") == 0) {
+        char defout[512]; const char *out = outarg;
+        if (!out) { derive_out(infile, ".c", defout, sizeof defout); out = defout; }
+        int r = compile_program_to_c(prog, out);
+        node_free(prog); free(buf);
+        if (!r) fprintf(stderr, "已生成 C 源码: %s\n", out);
+        return r;
+    }
+    if (strcmp(mode, "--编译") == 0) {
+        char tmpc[512]; snprintf(tmpc, sizeof tmpc, "/tmp/co_native_%d.c", (int)getpid());
+        if (compile_program_to_c(prog, tmpc) != 0) { node_free(prog); free(buf); return 1; }
+        char defbin[512]; const char *bin = outarg;
+        if (!bin) { derive_out(infile, "", defbin, sizeof defbin); bin = defbin; }
+        char cmd[2048]; snprintf(cmd, sizeof cmd, "cc -O2 -Wall -Wextra %s -o %s -lm", tmpc, bin);
+        int r = system(cmd);
+        if (r != 0) { fprintf(stderr, "编译失败（C 源码已暂存于 %s）\n", tmpc); node_free(prog); free(buf); return 1; }
+        fprintf(stderr, "已编译原生二进制: %s\n", bin);
+        node_free(prog); free(buf);
+        return 0;
+    }
+    node_free(prog); free(buf);
+    return 1;
+}
+
 /* ========== 主程序 ========== */
 int main(int argc, char **argv) {
     stack_guard_init(0);          /* 必须最先执行：以 main 的栈帧为基准 */
     srand((unsigned int)time(NULL));
     env_lock_init();
-    
+
+    if (argc >= 2 && (strcmp(argv[1], "--生成C") == 0 || strcmp(argv[1], "--编译") == 0)) {
+        if (argc < 3) {
+            fprintf(stderr, "用法: co %s <脚本.co> [输出文件]\n", argv[1]);
+            return 1;
+        }
+        return do_compile(argv[1], argv[2], argc >= 4 ? argv[3] : NULL);
+    }
+
     if (argc < 2) {
         fprintf(stderr, "用法: co <脚本.co>\n");
         fprintf(stderr, "示例: ./co hello.co\n");
