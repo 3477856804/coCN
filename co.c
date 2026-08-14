@@ -6,6 +6,8 @@
 #include <math.h>
 #include <stdarg.h>
 #include <time.h>
+#include <pthread.h>
+#include <sys/time.h>
 
 /* ========== 基础定义 ========== */
 #define MAX_ID_LEN     128
@@ -21,7 +23,10 @@ struct Node;
 /* 值类型 */
 typedef enum {
     VAL_NULL, VAL_INT, VAL_FLOAT, VAL_STRING,
-    VAL_LIST, VAL_TENSOR, VAL_FUNC, VAL_MAP
+    VAL_LIST, VAL_TENSOR, VAL_FUNC, VAL_MAP, VAL_TASK,
+    /* 布尔是独立的一等类型（不是整数别名）：打印为 真/假，
+       比较与逻辑运算的结果都是布尔。追加在末尾以不扰动既有枚举序。 */
+    VAL_BOOL
 } ValType;
 
 /* 张量结构（含自动求导所需字段） */
@@ -60,8 +65,21 @@ typedef struct Func {
     char  *name;
     char **params;
     int    param_count;
+    char **ptypes;   /* 参数类型标注（可空） */
+    char  *ret_type; /* 返回类型标注（可空） */
     void  *body;
 } Func;
+
+/* 并发任务句柄：线程、待求值表达式、隔离环境、结果四者必须共存，
+   因此独立成结构体——绝不可拆成 union 成员（会互相覆盖）。 */
+typedef struct Task {
+    pthread_t     tid;
+    struct Node  *node;
+    struct Env   *env;
+    struct Value *result;   /* 由 worker 线程写入，join 后主线程读取 */
+    int           started;  /* 线程是否成功创建 */
+    int           joined;   /* 是否已 join，防止重复 join */
+} Task;
 
 /* 值对象 (带引用计数) */
 typedef struct Value {
@@ -75,6 +93,7 @@ typedef struct Value {
         Tensor   *tval;
         Func     *fnval;
         Map      *mval;
+        Task     *task;     /* 并发任务句柄（VAL_TASK） */
     };
     int list_len;
 } Value;
@@ -83,8 +102,12 @@ typedef struct Value {
 typedef struct Env {
     char   *names[MAX_LOCALS];
     Value  *values[MAX_LOCALS];
+    char   *types[MAX_LOCALS];   /* 变量类型标注（可空） */
     int     count;
     struct Env *parent;
+    /* 是否可能被多个线程同时访问：创建并发任务时，其外层环境链会被标记为共享。
+       只有共享环境的读写才加锁——任务自身的局部环境走无锁热路径。 */
+    int     shared;
 } Env;
 
 /* 循环控制上下文 */
@@ -95,8 +118,24 @@ typedef struct LoopContext {
     struct LoopContext *parent;
 } LoopContext;
 
-/* ========== 全局状态 ========== */
-static LoopContext *loop_ctx = NULL;
+/* ========== 全局状态 ==========
+   注意：解释器支持 并发/等待（真 pthread 并行），
+   凡是"当前执行流"的状态都必须是【线程局部】的，
+   否则多个任务会互相踩踏返回值与循环控制标志。 */
+static __thread LoopContext *loop_ctx = NULL;
+
+/* 全局根环境：高阶内置函数回调用户函数时作为父环境使用 */
+static struct Env *g_root_env = NULL;
+
+/* 已导入模块的 AST（其函数体被合并进调用方环境，故需保留至程序结束） */
+static struct Node **g_imported = NULL;
+static int g_imported_cnt = 0, g_imported_cap = 0;
+
+/* 前向声明：值构造与真值判断（被定义位置更靠前的内置函数引用） */
+static Value *val_int(long x);
+static Value *val_flt(double x);
+static Value *val_bool(int b);
+static int    truthy(Value *v);
 
 /* ========== 值管理 ========== */
 static Value *val_new(ValType type) {
@@ -111,8 +150,9 @@ static Value *val_new(ValType type) {
 
 void val_free(Value *v) {
     if (!v) return;
-    v->refcount--;
-    if (v->refcount > 0) return;
+    /* 原子递减：并发任务与主线程可能同时持有同一个值（如全局列表/函数），
+       非原子的 refcount-- 会丢失更新，导致提前释放或永久泄漏。 */
+    if (__atomic_sub_fetch(&v->refcount, 1, __ATOMIC_ACQ_REL) > 0) return;
     switch (v->type) {
         case VAL_STRING: free(v->sval); break;
         case VAL_LIST:
@@ -138,88 +178,219 @@ void val_free(Value *v) {
                 free(v->fnval);
             }
             break;
+        case VAL_TASK:
+            /* 句柄被丢弃时若任务仍在跑，必须 join 后再回收，避免线程访问已释放环境 */
+            if (v->task) {
+                if (v->task->started && !v->task->joined) {
+                    pthread_join(v->task->tid, NULL);
+                    v->task->joined = 1;
+                }
+                if (v->task->result) val_free(v->task->result);
+                free(v->task);
+            }
+            break;
         default: break;
     }
     free(v);
 }
 
 static Value *val_retain(Value *v) {
-    if (v) v->refcount++;
+    if (v) __atomic_add_fetch(&v->refcount, 1, __ATOMIC_ACQ_REL);
     return v;
 }
 
-/* 值转字符串 */
-static char *val_to_string(Value *v) {
-    char buf[256];
+/* 下标取值（兼容浮点下标，向零截断） */
+static long idx_val(Value *idx) {
+    return (idx->type == VAL_FLOAT) ? (long)idx->fval : idx->ival;
+}
+
+/* ========== UTF-8 字符层 ==========
+   coCN 是中文编程语言，字符串的一切"长度/下标/截取/查找"
+   都必须以【字符（码点）】为单位，而不是字节。
+   否则 长度("苹果") 会得到 6，"苹果"[0] 会取到半个汉字。 */
+
+/* 该起始字节所引导的 UTF-8 序列字节数（非法字节按 1 处理，保证不死循环） */
+static int utf8_seq_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+/* 字符（码点）个数 */
+static long utf8_strlen(const char *s) {
+    long n = 0;
+    for (const char *p = s; *p; ) { p += utf8_seq_len((unsigned char)*p); n++; }
+    return n;
+}
+
+/* 第 ci 个字符的字节偏移；ci 等于总字符数时返回 strlen；越界返回 -1 */
+static long utf8_byte_offset(const char *s, long ci) {
+    if (ci < 0) return -1;
+    long n = 0; const char *p = s;
+    while (*p && n < ci) { p += utf8_seq_len((unsigned char)*p); n++; }
+    if (n < ci) return -1;
+    return (long)(p - s);
+}
+
+/* 把字节偏移换算成字符下标（供 查找 返回字符位置） */
+static long utf8_char_index(const char *s, long byte_off) {
+    long n = 0;
+    for (const char *p = s; *p && (p - s) < byte_off; ) { p += utf8_seq_len((unsigned char)*p); n++; }
+    return n;
+}
+
+/* 取第 ci 个字符，返回新分配的字符串；越界返回 NULL */
+static char *utf8_char_at(const char *s, long ci) {
+    long off = utf8_byte_offset(s, ci);
+    if (off < 0 || !s[off]) return NULL;
+    int len = utf8_seq_len((unsigned char)s[off]);
+    char *r = malloc(len + 1);
+    memcpy(r, s + off, len);
+    r[len] = '\0';
+    return r;
+}
+
+/* 按字符截取 [start, start+count)，自动裁剪到合法范围 */
+static char *utf8_substr(const char *s, long start, long count) {
+    long total = utf8_strlen(s);
+    if (start < 0) start += total;            /* 支持负索引 */
+    if (start < 0) start = 0;
+    if (start > total) start = total;
+    if (count < 0) count = 0;
+    if (start + count > total) count = total - start;
+    long b0 = utf8_byte_offset(s, start);
+    long b1 = utf8_byte_offset(s, start + count);
+    if (b0 < 0) b0 = 0;
+    if (b1 < 0) b1 = (long)strlen(s);
+    long nb = b1 - b0;
+    char *r = malloc(nb + 1);
+    memcpy(r, s + b0, nb);
+    r[nb] = '\0';
+    return r;
+}
+
+/* ---------- 动态字符串构建器：杜绝固定缓冲区溢出 ---------- */
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} SBuf;
+
+static void sb_init(SBuf *sb) {
+    sb->cap = 64;
+    sb->len = 0;
+    sb->buf = malloc(sb->cap);
+    if (!sb->buf) { fprintf(stderr, "内存不足: 字符串构建器\n"); exit(1); }
+    sb->buf[0] = '\0';
+}
+static void sb_reserve(SBuf *sb, size_t extra) {
+    if (sb->len + extra + 1 <= sb->cap) return;
+    size_t nc = sb->cap ? sb->cap : 64;
+    while (nc < sb->len + extra + 1) nc *= 2;
+    char *nb = realloc(sb->buf, nc);
+    if (!nb) { fprintf(stderr, "内存不足: 字符串构建器扩容\n"); exit(1); }
+    sb->buf = nb;
+    sb->cap = nc;
+}
+static void sb_append(SBuf *sb, const char *s) {
+    if (!s) s = "";
+    size_t n = strlen(s);
+    sb_reserve(sb, n);
+    memcpy(sb->buf + sb->len, s, n);
+    sb->len += n;
+    sb->buf[sb->len] = '\0';
+}
+static void sb_appendf(SBuf *sb, const char *fmt, ...) {
+    char tmp[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n < sizeof(tmp)) { sb_append(sb, tmp); return; }
+    /* 超长：动态分配再写一次 */
+    char *big = malloc((size_t)n + 1);
+    if (!big) { fprintf(stderr, "内存不足: 格式化\n"); exit(1); }
+    va_start(ap, fmt);
+    vsnprintf(big, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    sb_append(sb, big);
+    free(big);
+}
+
+/* 值转字符串（内部：写入构建器，支持任意深度/长度） */
+static void val_to_sbuf(Value *v, SBuf *sb) {
+    if (!v) { sb_append(sb, "空"); return; }
     switch (v->type) {
-        case VAL_NULL: return strdup("空");
-        case VAL_INT: sprintf(buf, "%ld", v->ival); return strdup(buf);
-        case VAL_FLOAT: sprintf(buf, "%g", v->fval); return strdup(buf);
-        case VAL_STRING: return strdup(v->sval);
-        case VAL_LIST: {
-            char *s = malloc(4096);
-            strcpy(s, "[");
+        case VAL_NULL:  sb_append(sb, "空"); break;
+        case VAL_BOOL:  sb_append(sb, v->ival ? "真" : "假"); break;
+        case VAL_INT:   sb_appendf(sb, "%ld", v->ival); break;
+        case VAL_FLOAT: sb_appendf(sb, "%g", v->fval); break;
+        case VAL_STRING: sb_append(sb, v->sval ? v->sval : ""); break;
+        case VAL_LIST:
+            sb_append(sb, "[");
             for (int i = 0; i < v->list_len; i++) {
-                char *item = val_to_string(v->lval[i]);
-                strcat(s, item);
-                if (i < v->list_len - 1) strcat(s, ", ");
-                free(item);
+                if (i) sb_append(sb, ", ");
+                val_to_sbuf(v->lval[i], sb);
             }
-            strcat(s, "]");
-            return s;
-        }
+            sb_append(sb, "]");
+            break;
         case VAL_MAP: {
-            char *s = malloc(4096);
-            strcpy(s, "{");
+            sb_append(sb, "{");
             int first = 1;
             for (int i = 0; i < MAX_DICT_SIZE; i++) {
-                if (v->mval->entries[i].used) {
-                    if (!first) strcat(s, ", ");
-                    first = 0;
-                    strcat(s, "\"");
-                    strcat(s, v->mval->entries[i].key);
-                    strcat(s, "\": ");
-                    char *item = val_to_string(v->mval->entries[i].val);
-                    strcat(s, item);
-                    free(item);
-                }
+                if (!v->mval->entries[i].used) continue;
+                if (!first) sb_append(sb, ", ");
+                first = 0;
+                sb_append(sb, "\"");
+                sb_append(sb, v->mval->entries[i].key);
+                sb_append(sb, "\": ");
+                val_to_sbuf(v->mval->entries[i].val, sb);
             }
-            strcat(s, "}");
-            return s;
+            sb_append(sb, "}");
+            break;
         }
-        case VAL_FUNC: sprintf(buf, "<函数 %s>", v->fnval->name); return strdup(buf);
+        case VAL_FUNC:
+            sb_appendf(sb, "<函数 %s>", v->fnval && v->fnval->name ? v->fnval->name : "匿名");
+            break;
         case VAL_TENSOR: {
             Tensor *t = v->tval;
-            char *s = malloc(8192);
-            s[0] = '\0';
             if (t->ndim == 1) {
-                strcat(s, "[");
+                sb_append(sb, "[");
                 for (int i = 0; i < t->size; i++) {
-                    char b[32]; snprintf(b, sizeof(b), "%g", t->data[i]);
-                    strcat(s, b);
-                    if (i < t->size - 1) strcat(s, ", ");
+                    if (i) sb_append(sb, ", ");
+                    sb_appendf(sb, "%g", t->data[i]);
                 }
-                strcat(s, "]");
+                sb_append(sb, "]");
             } else if (t->ndim == 2) {
-                strcat(s, "[");
+                sb_append(sb, "[");
                 for (int i = 0; i < t->shape[0]; i++) {
-                    strcat(s, "[");
+                    if (i) sb_append(sb, ", ");
+                    sb_append(sb, "[");
                     for (int j = 0; j < t->shape[1]; j++) {
-                        char b[32]; snprintf(b, sizeof(b), "%g", t->data[i * t->shape[1] + j]);
-                        strcat(s, b);
-                        if (j < t->shape[1] - 1) strcat(s, ", ");
+                        if (j) sb_append(sb, ", ");
+                        sb_appendf(sb, "%g", t->data[i * t->shape[1] + j]);
                     }
-                    strcat(s, "]");
-                    if (i < t->shape[0] - 1) strcat(s, ", ");
+                    sb_append(sb, "]");
                 }
-                strcat(s, "]");
+                sb_append(sb, "]");
             } else {
-                snprintf(s, 8192, "<张量 shape=%dx%d>", t->shape[0], t->ndim > 1 ? t->shape[1] : 1);
+                sb_appendf(sb, "<张量 %d维 size=%d>", t->ndim, t->size);
             }
-            return s;
+            break;
         }
-        default: return strdup("<未知>");
+        default: sb_append(sb, "<未知>"); break;
     }
+}
+
+/* 值转字符串（对外：返回堆上新串，调用方负责 free） */
+static char *val_to_string(Value *v) {
+    SBuf sb;
+    sb_init(&sb);
+    val_to_sbuf(v, &sb);
+    return sb.buf;
 }
 
 /* ========== 字典操作 ========== */
@@ -247,14 +418,60 @@ static void dict_set(Map *m, const char *key, Value *val) {
     unsigned int h = dict_hash(key);
     for (int i = 0; i < MAX_DICT_SIZE; i++) {
         unsigned int idx = (h + i) % MAX_DICT_SIZE;
-        if (!m->entries[idx].used || strcmp(m->entries[idx].key, key) == 0) {
-            if (m->entries[idx].used) val_free(m->entries[idx].val);
+        if (m->entries[idx].used && strcmp(m->entries[idx].key, key) == 0) {
+            /* 覆盖已有键：复用原 key，只换值（原实现会 strdup 新 key 并泄漏旧 key） */
+            Value *old = m->entries[idx].val;
+            m->entries[idx].val = val_retain(val);
+            val_free(old);
+            return;
+        }
+        if (!m->entries[idx].used) {
             m->entries[idx].key = strdup(key);
             m->entries[idx].val = val_retain(val);
             m->entries[idx].used = 1;
+            m->count++;
             return;
         }
     }
+    /* 原实现在字典写满时静默丢数据，这里明确报错 */
+    fprintf(stderr, "运行时错误: 字典已满（上限 %d 个键），无法写入 \"%s\"\n", MAX_DICT_SIZE, key);
+    exit(1);
+}
+
+/* 删除键：线性探测下用“向后回填”保持探测链完整，返回是否删除成功 */
+static int dict_remove(Map *m, const char *key) {
+    unsigned int h = dict_hash(key);
+    int found = -1;
+    for (int i = 0; i < MAX_DICT_SIZE; i++) {
+        unsigned int idx = (h + i) % MAX_DICT_SIZE;
+        if (!m->entries[idx].used) return 0;
+        if (strcmp(m->entries[idx].key, key) == 0) { found = (int)idx; break; }
+    }
+    if (found < 0) return 0;
+    free(m->entries[found].key);
+    val_free(m->entries[found].val);
+    m->entries[found].used = 0;
+    m->entries[found].key = NULL;
+    m->entries[found].val = NULL;
+    m->count--;
+    /* 回填：把后续同簇元素重新插入到正确位置，避免探测链断裂导致查不到 */
+    int hole = found;
+    for (int i = 1; i < MAX_DICT_SIZE; i++) {
+        int idx = (found + i) % MAX_DICT_SIZE;
+        if (!m->entries[idx].used) break;
+        unsigned int ideal = dict_hash(m->entries[idx].key);
+        /* 若该元素可以合法地放到 hole 上，则搬过去 */
+        int dist_cur  = (idx - (int)ideal + MAX_DICT_SIZE) % MAX_DICT_SIZE;
+        int dist_hole = (hole - (int)ideal + MAX_DICT_SIZE) % MAX_DICT_SIZE;
+        if (dist_hole <= dist_cur) {
+            m->entries[hole] = m->entries[idx];
+            m->entries[idx].used = 0;
+            m->entries[idx].key = NULL;
+            m->entries[idx].val = NULL;
+            hole = idx;
+        }
+    }
+    return 1;
 }
 
 /* ========== 张量操作 ========== */
@@ -280,13 +497,15 @@ static Tensor *tensor_new(int ndim, int *shape) {
 }
 
 /* 张量引用计数保留 */
-static Tensor *tensor_retain(Tensor *t) { if (t) t->tref++; return t; }
+static Tensor *tensor_retain(Tensor *t) {
+    if (t) __atomic_add_fetch(&t->tref, 1, __ATOMIC_ACQ_REL);
+    return t;
+}
 
-/* 张量引用计数释放 */
+/* 张量引用计数释放（原子，支持并发任务共享张量） */
 static void tensor_free(Tensor *t) {
     if (!t) return;
-    t->tref--;
-    if (t->tref > 0) return;
+    if (__atomic_sub_fetch(&t->tref, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (t->children) {
         for (int i = 0; i < t->nchildren; i++) tensor_free(t->children[i]);
         free(t->children);
@@ -310,39 +529,108 @@ static void tensor_set_child(Tensor *parent, Tensor *child) {
 }
 
 /* ========== 环境操作 ========== */
+/* 必须用 calloc：names/values/types 三个指针数组若残留野指针，
+   作用域销毁时的 free(types[i]) 会破坏堆元数据（历史致命 bug）。 */
 static Env *env_new(Env *parent) {
-    Env *e = malloc(sizeof(Env));
-    e->count = 0;
+    Env *e = calloc(1, sizeof(Env));
+    if (!e) { fprintf(stderr, "错误：内存不足，无法创建作用域\n"); exit(1); }
     e->parent = parent;
     return e;
 }
 
+/* 共享环境的访问锁：递归锁，因为 env_get 会沿父链递归。
+   仅当环境被标记 shared 时才使用，故单线程程序无锁开销。 */
+static pthread_mutex_t g_env_lock;
+static void env_lock_init(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_env_lock, &a);
+    pthread_mutexattr_destroy(&a);
+}
+#define ENV_IS_SHARED(e) (__atomic_load_n(&(e)->shared, __ATOMIC_ACQUIRE))
+#define ENV_LOCK(e)   do { if (ENV_IS_SHARED(e)) pthread_mutex_lock(&g_env_lock);   } while (0)
+#define ENV_UNLOCK(e) do { if (ENV_IS_SHARED(e)) pthread_mutex_unlock(&g_env_lock); } while (0)
+
+/* 把某个环境及其所有祖先标记为跨线程共享（并发任务能看到它们） */
+static void env_mark_shared(Env *e) {
+    pthread_mutex_lock(&g_env_lock);
+    for (Env *p = e; p; p = p->parent)
+        __atomic_store_n(&p->shared, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_env_lock);
+}
+
 static Value *env_get(Env *e, const char *name) {
+    ENV_LOCK(e);
     for (int i = 0; i < e->count; i++)
-        if (strcmp(e->names[i], name) == 0) return e->values[i];
+        if (strcmp(e->names[i], name) == 0) { Value *v = e->values[i]; ENV_UNLOCK(e); return v; }
+    ENV_UNLOCK(e);
     if (e->parent) return env_get(e->parent, name);
     return NULL;
 }
 
 static void env_set(Env *e, const char *name, Value *val) {
+    ENV_LOCK(e);
     for (int i = 0; i < e->count; i++) {
         if (strcmp(e->names[i], name) == 0) {
             val_free(e->values[i]);
             e->values[i] = val_retain(val);
+            ENV_UNLOCK(e);
             return;
         }
     }
     if (e->count < MAX_LOCALS) {
-        e->names[e->count] = strdup(name);
+        e->names[e->count]  = strdup(name);
         e->values[e->count] = val_retain(val);
-        e->count++;
+        e->types[e->count]  = NULL;   /* 必须显式置空，否则销毁时 free 野指针 */
+        /* count 最后自增并使用 release 语义：确保其他线程看到 count 时，
+           对应的 names/values 槽位内容已经写入完毕。 */
+        __atomic_store_n(&e->count, e->count + 1, __ATOMIC_RELEASE);
+        ENV_UNLOCK(e);
+    } else {
+        ENV_UNLOCK(e);
+        fprintf(stderr, "错误：单个作用域变量数超过上限 %d（变量 %s）\n", MAX_LOCALS, name);
+        exit(1);
     }
+}
+
+/* 记录/查询变量类型标注（用于静态类型检查） */
+static void env_set_type(Env *e, const char *name, const char *type) {
+    ENV_LOCK(e);
+    for (int i = 0; i < e->count; i++) {
+        if (strcmp(e->names[i], name) == 0) {
+            if (e->types[i]) free(e->types[i]);
+            e->types[i] = type ? strdup(type) : NULL;
+            ENV_UNLOCK(e);
+            return;
+        }
+    }
+    if (e->count < MAX_LOCALS) {
+        e->names[e->count]  = strdup(name);
+        e->values[e->count] = NULL;
+        e->types[e->count]  = type ? strdup(type) : NULL;
+        __atomic_store_n(&e->count, e->count + 1, __ATOMIC_RELEASE);
+        ENV_UNLOCK(e);
+    } else {
+        ENV_UNLOCK(e);
+        fprintf(stderr, "错误：单个作用域变量数超过上限 %d（变量 %s）\n", MAX_LOCALS, name);
+        exit(1);
+    }
+}
+
+static const char *env_get_type(Env *e, const char *name) {
+    ENV_LOCK(e);
+    for (int i = 0; i < e->count; i++)
+        if (strcmp(e->names[i], name) == 0) { const char *t = e->types[i]; ENV_UNLOCK(e); return t; }
+    ENV_UNLOCK(e);
+    if (e->parent) return env_get_type(e->parent, name);
+    return NULL;
 }
 
 /* ========== 词法分析 ========== */
 typedef enum {
     TOK_EOF, TOK_ID, TOK_INT, TOK_FLOAT, TOK_STRING, TOK_MULTILINE_STRING,
-    TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_MOD,
+    TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_DBLSLASH, TOK_MOD,
     TOK_EQ, TOK_NE, TOK_LT, TOK_LE, TOK_GT, TOK_GE,
     TOK_ASSIGN, TOK_LPAREN, TOK_RPAREN, TOK_LBRACK, TOK_RBRACK,
     TOK_LBRACE, TOK_RBRACE, TOK_COLON, TOK_COMMA, TOK_NEWLINE, TOK_DOT,
@@ -351,7 +639,13 @@ typedef enum {
     TK_ELSE, TK_ELIF, TK_END, TK_WHILE, TK_LOOP, TK_BREAK, TK_CONTINUE,
     TK_PRINT, TK_TENSOR, TK_FOR, TK_FROM, TK_TO, TK_STEP,
     /* 逻辑运算符 */
-    TK_AND, TK_OR, TK_NOT
+    TK_AND, TK_OR, TK_NOT,
+    /* 强语言特性：布尔 / 模块 / 模式匹配 / 类型标注 / 推导式 */
+    TK_TRUE, TK_FALSE, TK_IMPORT, TK_MATCH, TK_IS, TK_DEFAULT, TK_IN, TK_ARROW,
+    TK_TYPE_INT, TK_TYPE_FLOAT, TK_TYPE_STRING, TK_TYPE_BOOL,
+    TK_TYPE_LIST, TK_TYPE_MAP, TK_TYPE_NULL,
+    TK_TYPE_NUM, TK_TYPE_FUNC, TK_TYPE_ANY,
+    TK_CONCUR, TK_WAIT   /* 并发原语：并发 / 等待 */
 } TokenType;
 
 typedef struct {
@@ -369,6 +663,9 @@ static void lex_error(const char *msg) {
     fprintf(stderr, "词法错误 (第%d行,%d列): %s\n", cur_tok.line, cur_tok.col, msg);
     exit(1);
 }
+
+/* 括号嵌套深度：>0 时换行被视为续行，支持多行列表/参数/字典字面量 */
+static int g_bracket_depth = 0;
 
 static void skip_whitespace() {
     while (src[src_pos]) {
@@ -397,12 +694,15 @@ static void skip_whitespace() {
             src_col++;
             continue;
         }
-        /* 换行符 - 只消费不设置token，由advance处理 */
-        if (src[src_pos] == '\n') { 
-            src_line++;
-            src_col = 1;
-            src_pos++;
-            continue;
+        /* 换行符：括号内视为续行直接吞掉；顶层保留，由 advance 产出 TOK_NEWLINE
+           以界定语句边界（否则解析器无法区分块与单行结构）。 */
+        if (src[src_pos] == '\n') {
+            if (g_bracket_depth > 0) { src_line++; src_col = 1; src_pos++; continue; }
+            break;
+        }
+        /* 行尾反斜杠：显式续行 */
+        if (src[src_pos] == '\\' && src[src_pos+1] == '\n') {
+            src_pos += 2; src_line++; src_col = 1; continue;
         }
         /* 其他字符，停止跳过 */
         break;
@@ -516,8 +816,10 @@ static void advance() {
         else if (strcmp(cur_tok.text, "返回") == 0) cur_tok.type = TK_RETURN;
         else if (strcmp(cur_tok.text, "如果") == 0) cur_tok.type = TK_IF;
         else if (strcmp(cur_tok.text, "则") == 0) cur_tok.type = TK_THEN;
+        else if (strcmp(cur_tok.text, "那么") == 0) cur_tok.type = TK_THEN;  /* 则 的口语别名 */
         else if (strcmp(cur_tok.text, "否则") == 0) cur_tok.type = TK_ELSE;
         else if (strcmp(cur_tok.text, "否则如果") == 0) cur_tok.type = TK_ELIF;
+        else if (strcmp(cur_tok.text, "否则若") == 0) cur_tok.type = TK_ELIF;  /* 与 若 配套 */
         else if (strcmp(cur_tok.text, "结束") == 0) cur_tok.type = TK_END;
         else if (strcmp(cur_tok.text, "当") == 0) cur_tok.type = TK_WHILE;
         else if (strcmp(cur_tok.text, "循环") == 0) cur_tok.type = TK_LOOP;
@@ -533,6 +835,31 @@ static void advance() {
         else if (strcmp(cur_tok.text, "且") == 0) cur_tok.type = TK_AND;
         else if (strcmp(cur_tok.text, "或") == 0) cur_tok.type = TK_OR;
         else if (strcmp(cur_tok.text, "非") == 0) cur_tok.type = TK_NOT;
+        /* 强语言特性关键字 */
+        else if (strcmp(cur_tok.text, "真") == 0) cur_tok.type = TK_TRUE;
+        else if (strcmp(cur_tok.text, "假") == 0) cur_tok.type = TK_FALSE;
+        else if (strcmp(cur_tok.text, "导入") == 0) cur_tok.type = TK_IMPORT;
+        else if (strcmp(cur_tok.text, "匹配") == 0) cur_tok.type = TK_MATCH;
+        else if (strcmp(cur_tok.text, "是") == 0) cur_tok.type = TK_IS;
+        else if (strcmp(cur_tok.text, "情况") == 0) cur_tok.type = TK_IS;  /* 是 的别名，读起来更像 case */
+        else if (strcmp(cur_tok.text, "默认") == 0) cur_tok.type = TK_DEFAULT;
+        /* 推导式里的"属于"：于 与 在 互为别名，后者更贴合其余语法的口语习惯 */
+        else if (strcmp(cur_tok.text, "于") == 0) cur_tok.type = TK_IN;
+        else if (strcmp(cur_tok.text, "在") == 0) cur_tok.type = TK_IN;
+        else if (strcmp(cur_tok.text, "若") == 0) cur_tok.type = TK_IF; /* 若 作为 如果 的简写别名 */
+        else if (strcmp(cur_tok.text, "整数") == 0) cur_tok.type = TK_TYPE_INT;
+        else if (strcmp(cur_tok.text, "浮点") == 0) cur_tok.type = TK_TYPE_FLOAT;
+        else if (strcmp(cur_tok.text, "字符串") == 0) cur_tok.type = TK_TYPE_STRING;
+        else if (strcmp(cur_tok.text, "布尔") == 0) cur_tok.type = TK_TYPE_BOOL;
+        else if (strcmp(cur_tok.text, "列表") == 0) cur_tok.type = TK_TYPE_LIST;
+        else if (strcmp(cur_tok.text, "字典") == 0) cur_tok.type = TK_TYPE_MAP;
+        else if (strcmp(cur_tok.text, "空") == 0) cur_tok.type = TK_TYPE_NULL;
+        /* 新增类型标注：数字（整数或浮点）、函数（可调用）、任意（关闭检查） */
+        else if (strcmp(cur_tok.text, "数字") == 0) cur_tok.type = TK_TYPE_NUM;
+        else if (strcmp(cur_tok.text, "函数值") == 0) cur_tok.type = TK_TYPE_FUNC;
+        else if (strcmp(cur_tok.text, "任意") == 0) cur_tok.type = TK_TYPE_ANY;
+        else if (strcmp(cur_tok.text, "并发") == 0) cur_tok.type = TK_CONCUR;
+        else if (strcmp(cur_tok.text, "等待") == 0) cur_tok.type = TK_WAIT;
         else cur_tok.type = TOK_ID;
         return;
     }
@@ -540,16 +867,26 @@ static void advance() {
     char c = src[src_pos++]; src_col++;
     switch (c) {
         case '+': cur_tok.type = TOK_PLUS; break;
-        case '-': cur_tok.type = TOK_MINUS; break;
+        case '-':
+            /* 多字符符号必须 return：函数尾部会把 text 覆写成单字符 */
+            if (src[src_pos] == '>') { src_pos++; src_col++; cur_tok.type = TK_ARROW; strcpy(cur_tok.text, "->"); return; }
+            cur_tok.type = TOK_MINUS; break;
         case '*': cur_tok.type = TOK_STAR; break;
-        case '/': cur_tok.type = TOK_SLASH; break;
+        case '/':
+            if (src[src_pos] == '/') {   /* // 整除 */
+                src_pos++; src_col++;
+                cur_tok.type = TOK_DBLSLASH;
+                cur_tok.text[0]='/'; cur_tok.text[1]='/'; cur_tok.text[2]=0;
+                return;
+            }
+            cur_tok.type = TOK_SLASH; break;
         case '%': cur_tok.type = TOK_MOD; break;
-        case '(': cur_tok.type = TOK_LPAREN; break;
-        case ')': cur_tok.type = TOK_RPAREN; break;
-        case '[': cur_tok.type = TOK_LBRACK; break;
-        case ']': cur_tok.type = TOK_RBRACK; break;
-        case '{': cur_tok.type = TOK_LBRACE; break;
-        case '}': cur_tok.type = TOK_RBRACE; break;
+        case '(': cur_tok.type = TOK_LPAREN; g_bracket_depth++; break;
+        case ')': cur_tok.type = TOK_RPAREN; if (g_bracket_depth > 0) g_bracket_depth--; break;
+        case '[': cur_tok.type = TOK_LBRACK; g_bracket_depth++; break;
+        case ']': cur_tok.type = TOK_RBRACK; if (g_bracket_depth > 0) g_bracket_depth--; break;
+        case '{': cur_tok.type = TOK_LBRACE; g_bracket_depth++; break;
+        case '}': cur_tok.type = TOK_RBRACE; if (g_bracket_depth > 0) g_bracket_depth--; break;
         case ':': cur_tok.type = TOK_COLON; break;
         case ',': cur_tok.type = TOK_COMMA; break;
         case '.': cur_tok.type = TOK_DOT; break;
@@ -558,16 +895,14 @@ static void advance() {
             else { cur_tok.type = TOK_ASSIGN; cur_tok.text[0] = '='; cur_tok.text[1] = 0; }
             return;
         case '<':
-            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_LE; strcpy(cur_tok.text, "<="); }
-            else cur_tok.type = TOK_LT;
-            break;
+            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_LE; strcpy(cur_tok.text, "<="); return; }
+            cur_tok.type = TOK_LT; break;
         case '>':
-            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_GE; strcpy(cur_tok.text, ">="); }
-            else cur_tok.type = TOK_GT;
-            break;
-        case '!': 
-            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_NE; }
-            else lex_error("未知符号 '!'，期望 '!='");
+            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_GE; strcpy(cur_tok.text, ">="); return; }
+            cur_tok.type = TOK_GT; break;
+        case '!':
+            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_NE; strcpy(cur_tok.text, "!="); return; }
+            lex_error("未知符号 '!'，期望 '!='");
             break;
         default: 
             fprintf(stderr, "未识别的字符: 0x%02X at line=%d col=%d pos=%d\n", 
@@ -615,7 +950,9 @@ typedef enum {
     ND_FUNC_DEF, ND_FUNC_CALL, ND_RETURN,
     ND_IF, ND_WHILE, ND_FOR,
     ND_BINARY, ND_UNARY, ND_LITERAL,
-    ND_LIST_LIT, ND_MAP_LIT, ND_BREAK, ND_CONTINUE
+    ND_LIST_LIT, ND_MAP_LIT, ND_BREAK, ND_CONTINUE,
+    ND_IMPORT, ND_MATCH,  /* 强语言特性：模块导入 / 模式匹配 */
+    ND_CONCUR, ND_WAIT    /* 并发原语：并发 / 等待 */
 } NodeType;
 
 /* else分支结构 */
@@ -626,16 +963,24 @@ typedef struct ElseBranch {
     int is_else;
 } ElseBranch;
 
+/* 模式匹配分支 */
+typedef struct MatchArm {
+    struct Node *pattern;     /* 字面量/范围/标识符(通配) */
+    struct Node **body;
+    int bcnt;
+    int is_default;           /* 默认分支 */
+} MatchArm;
+
 typedef struct Node {
     NodeType type;
     int line;
     int col;
     union {
         struct { struct Node **stmts; int cnt; } prog;
-        struct { char *name; struct Node *init; int is_const; } var_decl;
+        struct { char *name; struct Node *init; int is_const; char *type_annot; } var_decl;
         struct { struct Node *tgt, *val; } assign;
         struct { char *name; } ident;
-        struct { char *name; char **pnames; int pcnt; struct Node *body; } func_def;
+        struct { char *name; char **pnames; int pcnt; char **ptypes; char *ret_type; struct Node *body; } func_def;
         struct { struct Node *callee; struct Node **args; int acnt; } func_call;
         struct { struct Node *val; } ret_stmt;
         struct { struct Node *cond; struct Node **then_body; int tcnt; 
@@ -646,8 +991,12 @@ typedef struct Node {
         struct { char op[8]; struct Node *left, *right; } binary;
         struct { char op[8]; struct Node *operand; } unary;
         struct { char *value; ValType lit_type; } literal;
-        struct { struct Node **elements; int ecnt; } list_lit;
-        struct { struct Node **keys; struct Node **vals; int kcnt; } map_lit;
+        struct { struct Node **elements; int ecnt; int is_comprehension; } list_lit;
+        struct { struct Node **keys; struct Node **vals; int kcnt; int is_comprehension; } map_lit;
+        struct { char *path; } import_stmt;
+        struct { struct Node *expr; MatchArm *arms; int arm_cnt; } match_stmt;
+        struct { struct Node *expr; } concur_stmt;  /* 并发 expr */
+        struct { struct Node *expr; } wait_stmt;    /* 等待 expr */
     };
 } Node;
 
@@ -660,6 +1009,7 @@ static void node_free(Node *n) {
             free(n->prog.stmts); break;
         case ND_VAR_DECL:
             free(n->var_decl.name);
+            free(n->var_decl.type_annot);
             if (n->var_decl.init) node_free(n->var_decl.init);
             break;
         case ND_ASSIGN:
@@ -668,8 +1018,10 @@ static void node_free(Node *n) {
             free(n->ident.name); break;
         case ND_FUNC_DEF:
             free(n->func_def.name);
-            for (int i = 0; i < n->func_def.pcnt; i++) free(n->func_def.pnames[i]);
+            free(n->func_def.ret_type);
+            for (int i = 0; i < n->func_def.pcnt; i++) { free(n->func_def.pnames[i]); free(n->func_def.ptypes[i]); }
             free(n->func_def.pnames);
+            free(n->func_def.ptypes);
             node_free(n->func_def.body);
             break;
         case ND_FUNC_CALL:
@@ -710,11 +1062,41 @@ static void node_free(Node *n) {
         case ND_LITERAL:
             free(n->literal.value); break;
         case ND_LIST_LIT:
-            for (int i = 0; i < n->list_lit.ecnt; i++) node_free(n->list_lit.elements[i]);
+            for (int i = 0; i < n->list_lit.ecnt; i++) if (n->list_lit.elements[i]) node_free(n->list_lit.elements[i]);
             free(n->list_lit.elements); break;
         case ND_MAP_LIT:
-            for (int i = 0; i < n->map_lit.kcnt; i++) { node_free(n->map_lit.keys[i]); node_free(n->map_lit.vals[i]); }
+            if (n->map_lit.is_comprehension) {
+                /* 推导式：keys[2]==vals[2]、keys[3]==vals[3] 为同一节点，只释放一次 */
+                if (n->map_lit.keys[0]) node_free(n->map_lit.keys[0]);
+                if (n->map_lit.vals[0]) node_free(n->map_lit.vals[0]);
+                if (n->map_lit.keys[1]) node_free(n->map_lit.keys[1]);
+                if (n->map_lit.vals[1]) node_free(n->map_lit.vals[1]);
+                if (n->map_lit.keys[2]) node_free(n->map_lit.keys[2]);
+                if (n->map_lit.keys[3]) node_free(n->map_lit.keys[3]);
+                free(n->map_lit.keys); free(n->map_lit.vals);
+                break;
+            }
+            for (int i = 0; i < n->map_lit.kcnt; i++) { if (n->map_lit.keys[i]) node_free(n->map_lit.keys[i]); if (n->map_lit.vals[i]) node_free(n->map_lit.vals[i]); }
             free(n->map_lit.keys); free(n->map_lit.vals); break;
+        case ND_IMPORT:
+            free(n->import_stmt.path); break;
+        case ND_CONCUR:
+            if (n->concur_stmt.expr) node_free(n->concur_stmt.expr);
+            break;
+        case ND_WAIT:
+            if (n->wait_stmt.expr) node_free(n->wait_stmt.expr);
+            break;
+        case ND_MATCH: {
+            if (n->match_stmt.expr) node_free(n->match_stmt.expr);
+            for (int a = 0; a < n->match_stmt.arm_cnt; a++) {
+                MatchArm *arm = &n->match_stmt.arms[a];
+                if (!arm->is_default && arm->pattern) node_free(arm->pattern);
+                for (int i = 0; i < arm->bcnt; i++) node_free(arm->body[i]);
+                free(arm->body);
+            }
+            free(n->match_stmt.arms);
+            break;
+        }
         default: break;
     }
     free(n);
@@ -733,6 +1115,13 @@ static Node *make_node(NodeType t) {
 }
 
 static Node *parse_primary() {
+    if (cur_tok.type == TK_TRUE || cur_tok.type == TK_FALSE) {
+        Node *n = make_node(ND_LITERAL);
+        n->literal.lit_type = VAL_BOOL;   /* 布尔是一等类型，不再退化为整数 0/1 */
+        n->literal.value = strdup(cur_tok.type == TK_TRUE ? "1" : "0");
+        advance();
+        return n;
+    }
     if (cur_tok.type == TOK_INT || cur_tok.type == TOK_FLOAT) {
         Node *n = make_node(ND_LITERAL);
         n->literal.lit_type = (cur_tok.type == TOK_INT) ? VAL_INT : VAL_FLOAT;
@@ -773,12 +1162,35 @@ static Node *parse_primary() {
         Node *n = make_node(ND_LIST_LIT);
         advance();
         n->list_lit.elements = NULL; int cnt = 0, cap = 0;
+        n->list_lit.is_comprehension = 0;
         if (cur_tok.type != TOK_RBRACK) {
-            do {
+            Node *first = parse_expression();
+            if (cur_tok.type == TK_FOR) {
+                /* 列表推导式：[body 对于 x 于 src 若 filter] */
+                advance(); /* 跳过 对于 */
+                if (cur_tok.type != TOK_ID) { fprintf(stderr, "语法错误 (第%d行): 推导式需要迭代变量\n", cur_tok.line); exit(1); }
+                Node *iter = make_node(ND_IDENT); iter->ident.name = strdup(cur_tok.text); advance();
+                expect(TK_IN);
+                Node *src = parse_expression();
+                Node *filter = NULL;
+                if (cur_tok.type == TK_IF) { advance(); filter = parse_expression(); }
+                expect(TOK_RBRACK);
+                n->list_lit.elements = malloc(4 * sizeof(Node*));
+                n->list_lit.elements[0] = first;
+                n->list_lit.elements[1] = iter;
+                n->list_lit.elements[2] = src;
+                n->list_lit.elements[3] = filter; /* 可能为 NULL */
+                n->list_lit.ecnt = 4;
+                n->list_lit.is_comprehension = 1;
+                return n;
+            }
+            if (cnt >= cap) { cap = cap ? cap*2 : 4; n->list_lit.elements = realloc(n->list_lit.elements, cap * sizeof(Node*)); }
+            n->list_lit.elements[cnt++] = first;
+            while (cur_tok.type == TOK_COMMA && (advance(), 1)) {
                 Node *elem = parse_expression();
                 if (cnt >= cap) { cap = cap ? cap*2 : 4; n->list_lit.elements = realloc(n->list_lit.elements, cap * sizeof(Node*)); }
                 n->list_lit.elements[cnt++] = elem;
-            } while (cur_tok.type == TOK_COMMA && (advance(), 1));
+            }
         }
         n->list_lit.ecnt = cnt;
         expect(TOK_RBRACK);
@@ -789,40 +1201,87 @@ static Node *parse_primary() {
         n->map_lit.keys = NULL;
         n->map_lit.vals = NULL;
         int cnt = 0, cap = 0;
+        n->map_lit.is_comprehension = 0;
         if (cur_tok.type != TOK_RBRACE) {
-            do {
+            /* 解析第一个 key:val（用于判断是否为推导式）
+               关键：裸标识符键有二义性——
+                 普通字典 {苹果: 1}   → 键是字符串 "苹果"（语法糖）
+                 推导式   {w: 长度(w) 对于 w,v 于 ...} → 键是变量 w 的值
+               因此先按表达式解析，等看到（或看不到）"对于" 再决定语义。 */
+            Node *k0, *v0;
+            int k0_bare_id = 0;
+            if (cur_tok.type == TOK_STRING || cur_tok.type == TOK_MULTILINE_STRING) {
+                char buf[MAX_ID_LEN * 2];
+                process_escape(buf, cur_tok.text, strlen(cur_tok.text));
+                k0 = make_node(ND_LITERAL); k0->literal.lit_type = VAL_STRING;
+                k0->literal.value = strdup(buf); advance();
+            } else {
+                k0 = parse_expression();
+                k0_bare_id = (k0->type == ND_IDENT);   /* 单个裸标识符，语义待定 */
+            }
+            expect(TOK_COLON);
+            v0 = parse_expression();
+            if (cur_tok.type != TK_FOR && k0_bare_id) {
+                /* 不是推导式 → 裸标识符键退化为字符串字面量（向后兼容语法糖） */
+                Node *lit = make_node(ND_LITERAL);
+                lit->literal.lit_type = VAL_STRING;
+                lit->literal.value = strdup(k0->ident.name);
+                node_free(k0);
+                k0 = lit;
+            }
+            if (cur_tok.type == TK_FOR) {
+                /* 字典推导式：{k:v 对于 kk, vv 于 src 若 filter} */
+                advance(); /* 对于 */
+                if (cur_tok.type != TOK_ID) { fprintf(stderr, "语法错误 (第%d行): 推导式需要迭代变量\n", cur_tok.line); exit(1); }
+                Node *ik = make_node(ND_IDENT); ik->ident.name = strdup(cur_tok.text); advance();
+                /* 第二个迭代变量可选：
+                     {k: v 对于 键, 值 在 字典}  → 双变量，分别绑定键与值
+                     {w: 长度(w) 对于 w 在 列表} → 单变量，直接绑定元素（字典源则绑定键） */
+                Node *iv = NULL;
+                if (cur_tok.type == TOK_COMMA) {
+                    advance();
+                    if (cur_tok.type != TOK_ID) { fprintf(stderr, "语法错误 (第%d行): 推导式需要第二个迭代变量\n", cur_tok.line); exit(1); }
+                    iv = make_node(ND_IDENT); iv->ident.name = strdup(cur_tok.text); advance();
+                }
+                expect(TK_IN);
+                Node *src = parse_expression();
+                Node *filter = NULL;
+                if (cur_tok.type == TK_IF) { advance(); filter = parse_expression(); }
+                expect(TOK_RBRACE);
+                n->map_lit.keys = malloc(4 * sizeof(Node*));
+                n->map_lit.vals = malloc(4 * sizeof(Node*));
+                n->map_lit.keys[0] = k0; n->map_lit.vals[0] = v0;
+                n->map_lit.keys[1] = ik; n->map_lit.vals[1] = iv;
+                n->map_lit.keys[2] = src; n->map_lit.vals[2] = src;
+                n->map_lit.keys[3] = filter; n->map_lit.vals[3] = filter;
+                n->map_lit.kcnt = 4;
+                n->map_lit.is_comprehension = 1;
+                return n;
+            }
+            if (cnt >= cap) { cap = cap ? cap*2 : 4;
+                n->map_lit.keys = realloc(n->map_lit.keys, cap * sizeof(Node*));
+                n->map_lit.vals = realloc(n->map_lit.vals, cap * sizeof(Node*)); }
+            n->map_lit.keys[cnt] = k0; n->map_lit.vals[cnt] = v0; cnt++;
+            while (cur_tok.type == TOK_COMMA && (advance(), 1)) {
+                Node *key;
                 if (cur_tok.type == TOK_STRING || cur_tok.type == TOK_MULTILINE_STRING) {
                     char buf[MAX_ID_LEN * 2];
                     process_escape(buf, cur_tok.text, strlen(cur_tok.text));
-                    Node *key = make_node(ND_LITERAL);
-                    key->literal.lit_type = VAL_STRING;
-                    key->literal.value = strdup(buf);
-                    if (cnt >= cap) { cap = cap ? cap*2 : 4; 
-                        n->map_lit.keys = realloc(n->map_lit.keys, cap * sizeof(Node*));
-                        n->map_lit.vals = realloc(n->map_lit.vals, cap * sizeof(Node*)); }
-                    n->map_lit.keys[cnt] = key;
-                    advance();
+                    key = make_node(ND_LITERAL); key->literal.lit_type = VAL_STRING;
+                    key->literal.value = strdup(buf); advance();
                 } else if (cur_tok.type == TOK_ID) {
-                    Node *key = make_node(ND_LITERAL);
-                    key->literal.lit_type = VAL_STRING;
-                    key->literal.value = strdup(cur_tok.text);
-                    if (cnt >= cap) { cap = cap ? cap*2 : 4; 
-                        n->map_lit.keys = realloc(n->map_lit.keys, cap * sizeof(Node*));
-                        n->map_lit.vals = realloc(n->map_lit.vals, cap * sizeof(Node*)); }
-                    n->map_lit.keys[cnt] = key;
-                    advance();
+                    key = make_node(ND_LITERAL); key->literal.lit_type = VAL_STRING;
+                    key->literal.value = strdup(cur_tok.text); advance();
                 } else {
-                    Node *key = parse_expression();
-                    if (cnt >= cap) { cap = cap ? cap*2 : 4; 
-                        n->map_lit.keys = realloc(n->map_lit.keys, cap * sizeof(Node*));
-                        n->map_lit.vals = realloc(n->map_lit.vals, cap * sizeof(Node*)); }
-                    n->map_lit.keys[cnt] = key;
+                    key = parse_expression();
                 }
                 expect(TOK_COLON);
                 Node *val = parse_expression();
-                n->map_lit.vals[cnt] = val;
-                cnt++;
-            } while (cur_tok.type == TOK_COMMA && (advance(), 1));
+                if (cnt >= cap) { cap = cap ? cap*2 : 4;
+                    n->map_lit.keys = realloc(n->map_lit.keys, cap * sizeof(Node*));
+                    n->map_lit.vals = realloc(n->map_lit.vals, cap * sizeof(Node*)); }
+                n->map_lit.keys[cnt] = key; n->map_lit.vals[cnt] = val; cnt++;
+            }
         }
         n->map_lit.kcnt = cnt;
         expect(TOK_RBRACE);
@@ -866,6 +1325,21 @@ static Node *parse_postfix() {
 }
 
 static Node *parse_unary() {
+    /* 并发/等待 属于一元前缀运算符，优先级高于所有二元运算符。
+       这样 `等待 甲 + 等待 乙` 才会解析成 (等待 甲) + (等待 乙)；
+       若要并发整个表达式，请显式加括号：并发 (甲 + 乙)。 */
+    if (cur_tok.type == TK_CONCUR) {
+        advance();
+        Node *n = make_node(ND_CONCUR);
+        n->concur_stmt.expr = parse_unary();
+        return n;
+    }
+    if (cur_tok.type == TK_WAIT) {
+        advance();
+        Node *n = make_node(ND_WAIT);
+        n->wait_stmt.expr = parse_unary();
+        return n;
+    }
     if (cur_tok.type == TOK_MINUS || cur_tok.type == TOK_PLUS) {
         Token op = cur_tok;
         advance();
@@ -886,7 +1360,8 @@ static Node *parse_unary() {
 
 static Node *parse_mul() {
     Node *left = parse_unary();
-    while (cur_tok.type == TOK_STAR || cur_tok.type == TOK_SLASH || cur_tok.type == TOK_MOD) {
+    while (cur_tok.type == TOK_STAR || cur_tok.type == TOK_SLASH ||
+           cur_tok.type == TOK_DBLSLASH || cur_tok.type == TOK_MOD) {
         Token op = cur_tok; advance();
         Node *right = parse_unary();
         Node *n = make_node(ND_BINARY);
@@ -972,9 +1447,36 @@ static Node *parse_expression() {
     return parse_or();
 }
 
+/* 将类型 token 转换为类型标注字符串（用于类型系统） */
+static const char *type_token_name(TokenType t) {
+    switch (t) {
+        case TK_TYPE_INT:    return "整数";
+        case TK_TYPE_FLOAT:  return "浮点";
+        case TK_TYPE_STRING: return "字符串";
+        case TK_TYPE_BOOL:   return "布尔";
+        case TK_TYPE_LIST:   return "列表";
+        case TK_TYPE_MAP:    return "字典";
+        case TK_TYPE_NULL:   return "空";
+        case TK_TYPE_NUM:    return "数字";
+        case TK_TYPE_FUNC:   return "函数";
+        case TK_TYPE_ANY:    return "任意";
+        case TK_TENSOR:      return "张量";
+        default: return NULL;
+    }
+}
+
 static Node *parse_var_decl() {
-    Token kw = cur_tok; advance();
-    int is_const = (strcmp(kw.text, "常量") == 0);
+    int is_const = 0;
+    /* 可选 让/常量 关键字 */
+    if (cur_tok.type == TK_VAR || cur_tok.type == TK_CONST) {
+        is_const = (strcmp(cur_tok.text, "常量") == 0);
+        advance();
+    }
+    /* 可选类型标注：让 整数 x = 5  或  整数 x = 5 */
+    const char *annot = NULL;
+    const char *tn = type_token_name(cur_tok.type);
+    /* type_token_name 返回静态常量，无需 strdup（否则与下方 strdup 重复分配而泄漏） */
+    if (tn) { annot = tn; advance(); }
     if (cur_tok.type != TOK_ID) {
         fprintf(stderr, "语法错误 (第%d行,第%d列): 变量声明需要标识符, 得到 '%s'\n",
                 cur_tok.line, cur_tok.col, cur_tok.text);
@@ -991,6 +1493,7 @@ static Node *parse_var_decl() {
     n->var_decl.name = name;
     n->var_decl.init = init;
     n->var_decl.is_const = is_const;
+    n->var_decl.type_annot = annot ? strdup(annot) : NULL;
     return n;
 }
 
@@ -1016,21 +1519,35 @@ static Node *parse_print() {
 static Node *parse_if() {
     advance();
     Node *cond = parse_expression();
-    expect(TK_THEN);
-    
+    /* 块形式由【换行】决定，而不是由 则 决定：
+         若 n <= 1 返回 1          → 同行有语句，单行形式
+         如果 x > 5 则 y = 1       → 同行有语句，单行形式
+         如果 x > 5 [则] ⏎ ... 结束 → 换行，块形式
+       这样多行分支不必强制写 则，且完全兼容旧写法。 */
+    if (cur_tok.type == TK_THEN) advance();   /* 则 始终可选 */
+    int block_form = (cur_tok.type == TOK_NEWLINE);
+
     Node **then_body = NULL; int tcnt = 0, tcap = 0;
-    while (cur_tok.type != TOK_EOF) {
-        if (cur_tok.type == TOK_NEWLINE) { advance(); continue; }
-        if (cur_tok.type == TK_ELSE || cur_tok.type == TK_ELIF || cur_tok.type == TK_END) break;
-        Node *stmt = parse_statement();
-        if (stmt) {
-            if (tcnt >= tcap) { tcap = tcap ? tcap*2 : 4; then_body = realloc(then_body, tcap * sizeof(Node*)); }
-            then_body[tcnt++] = stmt;
+    if (block_form) {
+        while (cur_tok.type != TOK_EOF) {
+            if (cur_tok.type == TOK_NEWLINE) { advance(); continue; }
+            if (cur_tok.type == TK_ELSE || cur_tok.type == TK_ELIF || cur_tok.type == TK_END) break;
+            Node *stmt = parse_statement();
+            if (stmt) {
+                if (tcnt >= tcap) { tcap = tcap ? tcap*2 : 4; then_body = realloc(then_body, tcap * sizeof(Node*)); }
+                then_body[tcnt++] = stmt;
+            }
+        }
+    } else {
+        /* 单行 if：仅取紧跟的一条语句，且不消费外层 结束 */
+        while (cur_tok.type == TOK_NEWLINE) advance();
+        if (cur_tok.type != TK_ELSE && cur_tok.type != TK_ELIF && cur_tok.type != TK_END) {
+            Node *stmt = parse_statement();
+            if (stmt) { then_body = malloc(sizeof(Node*)); then_body[0] = stmt; tcnt = 1; }
         }
     }
-    
+
     ElseBranch *branches = NULL; int br_cnt = 0, br_cap = 0;
-    
     while (cur_tok.type == TK_ELIF || cur_tok.type == TK_ELSE) {
         ElseBranch br;
         if (cur_tok.type == TK_ELIF) {
@@ -1040,26 +1557,30 @@ static Node *parse_if() {
         } else {
             br.cond = NULL;
             br.is_else = 1;
-            advance(); /* 跳过'否则'，不需要'则' */
+            advance(); /* 跳过'否则' */
         }
-        if (cur_tok.type == TK_THEN) advance(); /* 否则如果有'则'也接受 */
-        
+        if (cur_tok.type == TK_THEN) advance();          /* 则 可选 */
+        int br_block = (cur_tok.type == TOK_NEWLINE);    /* 与 如果 采用同一判定规则 */
         br.body = NULL; br.bcnt = 0;
-        while (cur_tok.type != TOK_EOF) {
-            if (cur_tok.type == TOK_NEWLINE) { advance(); continue; }
-            if (cur_tok.type == TK_ELSE || cur_tok.type == TK_ELIF || cur_tok.type == TK_END) break;
-            Node *stmt = parse_statement();
-            if (stmt) {
-                br.body = realloc(br.body, (br.bcnt + 1) * sizeof(Node*));
-                br.body[br.bcnt++] = stmt;
+        if (br_block) {
+            while (cur_tok.type != TOK_EOF) {
+                if (cur_tok.type == TOK_NEWLINE) { advance(); continue; }
+                if (cur_tok.type == TK_ELSE || cur_tok.type == TK_ELIF || cur_tok.type == TK_END) break;
+                Node *stmt = parse_statement();
+                if (stmt) { br.body = realloc(br.body, (br.bcnt + 1) * sizeof(Node*)); br.body[br.bcnt++] = stmt; }
+            }
+        } else {
+            while (cur_tok.type == TOK_NEWLINE) advance();
+            if (cur_tok.type != TK_ELSE && cur_tok.type != TK_ELIF && cur_tok.type != TK_END) {
+                Node *stmt = parse_statement();
+                if (stmt) { br.body = malloc(sizeof(Node*)); br.body[0] = stmt; br.bcnt = 1; }
             }
         }
-        
         if (br_cnt >= br_cap) { br_cap = br_cap ? br_cap*2 : 4; branches = realloc(branches, br_cap * sizeof(ElseBranch)); }
         branches[br_cnt++] = br;
     }
-    
-    expect(TK_END);
+
+    if (block_form) expect(TK_END);
     Node *n = make_node(ND_IF);
     n->if_stmt.cond = cond;
     n->if_stmt.then_body = then_body;
@@ -1092,6 +1613,7 @@ static Node *parse_while() {
 
 static Node *parse_for() {
     advance();
+    if (type_token_name(cur_tok.type)) advance(); /* 可选类型标注：对于 整数 i 从 ... */
     if (cur_tok.type != TOK_ID) {
         fprintf(stderr, "语法错误 (第%d行,第%d列): 循环变量需要标识符, 得到 '%s'\n",
                 cur_tok.line, cur_tok.col, cur_tok.text);
@@ -1141,20 +1663,38 @@ static Node *parse_func_def() {
     char *name = strdup(cur_tok.text);
     advance();
     expect(TOK_LPAREN);
-    char **params = NULL; int pcnt = 0, pcap = 0;
+    char **params = NULL, **ptypes = NULL; int pcnt = 0, pcap = 0;
     if (cur_tok.type != TOK_RPAREN) {
         do {
+            const char *pt = NULL;
+            const char *tn = type_token_name(cur_tok.type);
+            if (tn) { pt = tn; advance(); }   /* 静态常量，见 parse_var_decl 同样说明 */
             if (cur_tok.type != TOK_ID) {
                 fprintf(stderr, "语法错误 (第%d行,第%d列): 参数需要标识符, 得到 '%s'\n",
                         cur_tok.line, cur_tok.col, cur_tok.text);
                 exit(1);
             }
-            if (pcnt >= pcap) { pcap = pcap ? pcap*2 : 4; params = realloc(params, pcap * sizeof(char*)); }
-            params[pcnt++] = strdup(cur_tok.text);
+            if (pcnt >= pcap) { pcap = pcap ? pcap*2 : 4; params = realloc(params, pcap * sizeof(char*)); ptypes = realloc(ptypes, pcap * sizeof(char*)); }
+            params[pcnt] = strdup(cur_tok.text);
+            ptypes[pcnt] = pt ? strdup(pt) : NULL;
+            pcnt++;
             advance();
         } while (cur_tok.type == TOK_COMMA && (advance(), 1));
     }
     expect(TOK_RPAREN);
+    /* 可选返回类型：函数 f(...) -> 整数 { ... } */
+    char *ret_type = NULL;
+    if (cur_tok.type == TK_ARROW) {
+        advance();
+        const char *tn = type_token_name(cur_tok.type);
+        if (!tn) {
+            fprintf(stderr, "语法错误 (第%d行,第%d列): 返回类型标注无效, 得到 '%s'\n",
+                    cur_tok.line, cur_tok.col, cur_tok.text);
+            exit(1);
+        }
+        ret_type = strdup(tn);
+        advance();
+    }
     Node *body = make_node(ND_PROGRAM);
     body->prog.stmts = NULL; int bcnt = 0, bcap = 0;
     while (cur_tok.type != TK_END && cur_tok.type != TOK_EOF) {
@@ -1170,19 +1710,78 @@ static Node *parse_func_def() {
     Node *n = make_node(ND_FUNC_DEF);
     n->func_def.name = name;
     n->func_def.pnames = params;
+    n->func_def.ptypes = ptypes;
     n->func_def.pcnt = pcnt;
+    n->func_def.ret_type = ret_type;
     n->func_def.body = body;
+    return n;
+}
+
+/* 模块导入：导入 "路径.co" */
+static Node *parse_import() {
+    advance();
+    char *path = NULL;
+    if (cur_tok.type == TOK_STRING || cur_tok.type == TOK_MULTILINE_STRING) {
+        path = strdup(cur_tok.text);
+        advance();
+    } else {
+        fprintf(stderr, "语法错误 (第%d行,第%d列): 导入需要字符串路径, 得到 '%s'\n",
+                cur_tok.line, cur_tok.col, cur_tok.text);
+        exit(1);
+    }
+    Node *n = make_node(ND_IMPORT);
+    n->import_stmt.path = path;
+    return n;
+}
+
+/* 模式匹配：匹配 expr { 是 模式: ...; 默认: ... } */
+static Node *parse_match() {
+    advance();
+    Node *expr = parse_expression();
+    MatchArm *arms = NULL; int arm_cnt = 0, arm_cap = 0;
+    /* 支持大括号包裹或缩进块；这里采用与 if/循环一致的换行块，
+       形如：匹配 x 是 1: ... 是 2: ... 默认: ... 结束 */
+    while (cur_tok.type != TK_END && cur_tok.type != TOK_EOF) {
+        if (cur_tok.type == TOK_NEWLINE) { advance(); continue; }
+        if (cur_tok.type != TK_IS && cur_tok.type != TK_DEFAULT) break;
+        MatchArm arm;
+        int is_default = (cur_tok.type == TK_DEFAULT);
+        advance();
+        arm.is_default = is_default;
+        arm.pattern = is_default ? NULL : parse_expression();
+        if (cur_tok.type == TOK_COLON) advance();
+        arm.body = NULL; arm.bcnt = 0;
+        /* 读取该分支语句，直到下一个 是/默认/结束 */
+        while (cur_tok.type != TK_END && cur_tok.type != TOK_EOF
+               && cur_tok.type != TK_IS && cur_tok.type != TK_DEFAULT) {
+            if (cur_tok.type == TOK_NEWLINE) { advance(); continue; }
+            Node *stmt = parse_statement();
+            if (stmt) {
+                arm.body = realloc(arm.body, (arm.bcnt + 1) * sizeof(Node*));
+                arm.body[arm.bcnt++] = stmt;
+            }
+        }
+        if (arm_cnt >= arm_cap) { arm_cap = arm_cap ? arm_cap*2 : 4; arms = realloc(arms, arm_cap * sizeof(MatchArm)); }
+        arms[arm_cnt++] = arm;
+    }
+    expect(TK_END);
+    Node *n = make_node(ND_MATCH);
+    n->match_stmt.expr = expr;
+    n->match_stmt.arms = arms;
+    n->match_stmt.arm_cnt = arm_cnt;
     return n;
 }
 
 static Node *parse_statement() {
     if (cur_tok.type == TOK_NEWLINE) { advance(); return NULL; }
-    if (cur_tok.type == TK_VAR || cur_tok.type == TK_CONST) return parse_var_decl();
+    if (cur_tok.type == TK_VAR || cur_tok.type == TK_CONST || type_token_name(cur_tok.type)) return parse_var_decl();
     if (cur_tok.type == TK_PRINT) return parse_print();
     if (cur_tok.type == TK_IF) return parse_if();
     if (cur_tok.type == TK_WHILE) return parse_while();
     if (cur_tok.type == TK_FOR) return parse_for();
     if (cur_tok.type == TK_FUNC) return parse_func_def();
+    if (cur_tok.type == TK_IMPORT) return parse_import();
+    if (cur_tok.type == TK_MATCH) return parse_match();
     if (cur_tok.type == TK_RETURN) {
         advance();
         Node *n = make_node(ND_RETURN);
@@ -1236,9 +1835,9 @@ static void runtime_error(Node *n, const char *msg, ...) {
 static Value *eval_node(Node *n, Env *env);
 static void exec_node(Node *n, Env *env);
 
-/* 控制流标志：用于实现返回/跳出/继续 */
-static int g_return_flag = 0;
-static Value *g_return_value = NULL;
+/* 控制流标志：用于实现返回/跳出/继续（线程局部，见上方说明） */
+static __thread int g_return_flag = 0;
+static __thread Value *g_return_value = NULL;
 
 /* 内置函数 */
 static Value *builtin_len(int argc, Value **argv) {
@@ -1246,7 +1845,7 @@ static Value *builtin_len(int argc, Value **argv) {
     Value *v = argv[0];
     Value *r = val_new(VAL_INT);
     switch (v->type) {
-        case VAL_STRING: r->ival = strlen(v->sval); break;
+        case VAL_STRING: r->ival = utf8_strlen(v->sval); break;   /* 按字符计数，非字节 */
         case VAL_LIST: r->ival = v->list_len; break;
         case VAL_MAP: {
             int cnt = 0;
@@ -1265,13 +1864,17 @@ static Value *builtin_type(int argc, Value **argv) {
     Value *r = val_new(VAL_STRING);
     switch (v->type) {
         case VAL_NULL: r->sval = strdup("空"); break;
+        case VAL_BOOL: r->sval = strdup("布尔"); break;
         case VAL_INT: r->sval = strdup("整数"); break;
-        case VAL_FLOAT: r->sval = strdup("浮点数"); break;
+        /* 与类型标注关键字保持一致（浮点，而非浮点数），
+           这样 类型(x) == "浮点" 与 浮点 x = ... 同名同义 */
+        case VAL_FLOAT: r->sval = strdup("浮点"); break;
         case VAL_STRING: r->sval = strdup("字符串"); break;
         case VAL_LIST: r->sval = strdup("列表"); break;
         case VAL_MAP: r->sval = strdup("字典"); break;
         case VAL_FUNC: r->sval = strdup("函数"); break;
         case VAL_TENSOR: r->sval = strdup("张量"); break;
+        case VAL_TASK: r->sval = strdup("任务"); break;
         default: r->sval = strdup("未知"); break;
     }
     return r;
@@ -1282,6 +1885,7 @@ static Value *builtin_int(int argc, Value **argv) {
     Value *v = argv[0], *r = val_new(VAL_INT);
     switch (v->type) {
         case VAL_INT: r->ival = v->ival; break;
+        case VAL_BOOL: r->ival = v->ival ? 1 : 0; break;
         case VAL_FLOAT: r->ival = (long)v->fval; break;
         case VAL_STRING: r->ival = atol(v->sval); break;
         default: r->ival = 0; break;
@@ -1294,6 +1898,7 @@ static Value *builtin_float(int argc, Value **argv) {
     Value *v = argv[0], *r = val_new(VAL_FLOAT);
     switch (v->type) {
         case VAL_INT: r->fval = v->ival; break;
+        case VAL_BOOL: r->fval = v->ival ? 1.0 : 0.0; break;
         case VAL_FLOAT: r->fval = v->fval; break;
         case VAL_STRING: r->fval = atof(v->sval); break;
         default: r->fval = 0.0; break;
@@ -1301,9 +1906,17 @@ static Value *builtin_float(int argc, Value **argv) {
     return r;
 }
 
+/* 转布尔(值)：按统一真值规则显式转换 */
+static Value *builtin_to_bool(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "转布尔函数需要1个参数");
+    return val_bool(truthy(argv[0]));
+}
+
 static Value *builtin_str(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "转字符串函数需要1个参数");
-    return val_new(VAL_STRING);
+    Value *r = val_new(VAL_STRING);
+    r->sval = val_to_string(argv[0]);   /* 真实转换：整数/浮点/列表/字典/张量均可 */
+    return r;
 }
 
 static Value *builtin_input(int argc, Value **argv) {
@@ -1355,43 +1968,139 @@ static Value *builtin_random(int argc, Value **argv) {
     return r;
 }
 
+/* 墙钟时间（秒，double），用于性能基准 */
+static Value *builtin_now(int argc, Value **argv) {
+    (void)argc; (void)argv;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    Value *r = val_new(VAL_FLOAT);
+    r->fval = (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+    return r;
+}
+
+/* 数值取出（整数/浮点/布尔统一为 double），非数字报错 */
+static double num_of(Value *v, const char *who) {
+    if (v->type == VAL_INT)   return (double)v->ival;
+    if (v->type == VAL_FLOAT) return v->fval;
+    if (v->type == VAL_BOOL)  return v->ival ? 1.0 : 0.0;  /* 真=1 假=0，允许参与算术 */
+    runtime_error(NULL, "%s 需要数字参数，收到 %s", who,
+                  v->type == VAL_STRING ? "字符串" : "非数字");
+    return 0;
+}
+
+/* 真值判断（唯一权威实现，所有条件/逻辑运算都必须走这里）：
+   假值 = 假 / 0 / 0.0 / 空 / "" / 空列表 / 空字典；其余为真。 */
+static int truthy(Value *v) {
+    if (!v) return 0;
+    switch (v->type) {
+        case VAL_BOOL:   return v->ival != 0;
+        case VAL_INT:    return v->ival != 0;
+        case VAL_FLOAT:  return v->fval != 0;
+        case VAL_STRING: return v->sval && v->sval[0];
+        case VAL_LIST:   return v->list_len > 0;
+        case VAL_MAP:    return v->mval && v->mval->count > 0;
+        case VAL_NULL:   return 0;
+        default:         return 1;
+    }
+}
+static Value *val_int(long x)   { Value *r = val_new(VAL_INT);   r->ival = x; return r; }
+static Value *val_flt(double x) { Value *r = val_new(VAL_FLOAT); r->fval = x; return r; }
+static Value *val_bool(int b)   { Value *r = val_new(VAL_BOOL);  r->ival = b ? 1 : 0; return r; }
+
+/* 取整 = 四舍五入（正确处理负数：-3.7 -> -4） */
 static Value *builtin_round(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "取整函数需要1个参数");
-    Value *v = argv[0], *r = val_new(VAL_INT);
-    if (v->type == VAL_FLOAT) {
-        r->ival = (long)(v->fval + 0.5);
-    } else {
-        r->ival = v->ival;
-    }
-    return r;
+    if (argv[0]->type == VAL_INT) return val_int(argv[0]->ival);
+    return val_int((long)llround(num_of(argv[0], "取整")));
+}
+static Value *builtin_floor(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "向下取整函数需要1个参数");
+    if (argv[0]->type == VAL_INT) return val_int(argv[0]->ival);
+    return val_int((long)floor(num_of(argv[0], "向下取整")));
+}
+static Value *builtin_ceil(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "向上取整函数需要1个参数");
+    if (argv[0]->type == VAL_INT) return val_int(argv[0]->ival);
+    return val_int((long)ceil(num_of(argv[0], "向上取整")));
+}
+static Value *builtin_trunc(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "截断函数需要1个参数");
+    if (argv[0]->type == VAL_INT) return val_int(argv[0]->ival);
+    return val_int((long)trunc(num_of(argv[0], "截断")));
 }
 
-static Value *builtin_max(int argc, Value **argv) {
-    if (argc < 2) runtime_error(NULL, "最大值函数需要至少2个参数");
-    double m;
-    if (argv[0]->type == VAL_FLOAT) m = argv[0]->fval;
-    else m = argv[0]->ival;
-    for (int i = 1; i < argc; i++) {
-        double v = (argv[i]->type == VAL_FLOAT) ? argv[i]->fval : argv[i]->ival;
-        if (v > m) m = v;
+/* 最大值/最小值：支持多参数，也支持单个列表；全整数则返回整数 */
+static Value *builtin_minmax(int argc, Value **argv, int want_max) {
+    const char *who = want_max ? "最大值" : "最小值";
+    Value **items = argv;
+    int n = argc;
+    if (argc == 1 && argv[0]->type == VAL_LIST) {
+        items = argv[0]->lval;
+        n = argv[0]->list_len;
     }
-    Value *r = val_new(VAL_FLOAT);
-    r->fval = m;
-    return r;
+    if (n < 1) runtime_error(NULL, "%s函数需要至少1个数字或一个非空列表", who);
+    int all_int = 1;
+    double m = num_of(items[0], who);
+    if (items[0]->type != VAL_INT) all_int = 0;
+    for (int i = 1; i < n; i++) {
+        double v = num_of(items[i], who);
+        if (items[i]->type != VAL_INT) all_int = 0;
+        if (want_max ? (v > m) : (v < m)) m = v;
+    }
+    return all_int ? val_int((long)m) : val_flt(m);
 }
+static Value *builtin_max(int argc, Value **argv) { return builtin_minmax(argc, argv, 1); }
+static Value *builtin_min(int argc, Value **argv) { return builtin_minmax(argc, argv, 0); }
 
-static Value *builtin_min(int argc, Value **argv) {
-    if (argc < 2) runtime_error(NULL, "最小值函数需要至少2个参数");
-    double m;
-    if (argv[0]->type == VAL_FLOAT) m = argv[0]->fval;
-    else m = argv[0]->ival;
-    for (int i = 1; i < argc; i++) {
-        double v = (argv[i]->type == VAL_FLOAT) ? argv[i]->fval : argv[i]->ival;
-        if (v < m) m = v;
+/* 幂、三角、对数、常量、符号 */
+static Value *builtin_pow(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "幂函数需要2个参数");
+    double b = num_of(argv[0], "幂"), e = num_of(argv[1], "幂");
+    double r = pow(b, e);
+    /* 整数底 + 非负整数指数 且结果可精确表示 -> 返回整数 */
+    if (argv[0]->type == VAL_INT && argv[1]->type == VAL_INT && argv[1]->ival >= 0 &&
+        fabs(r) < 9.0e15) return val_int((long)llround(r));
+    return val_flt(r);
+}
+static Value *builtin_sin(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "正弦函数需要1个参数");
+    return val_flt(sin(num_of(argv[0], "正弦")));
+}
+static Value *builtin_cos(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "余弦函数需要1个参数");
+    return val_flt(cos(num_of(argv[0], "余弦")));
+}
+static Value *builtin_tan(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "正切函数需要1个参数");
+    return val_flt(tan(num_of(argv[0], "正切")));
+}
+static Value *builtin_ln(int argc, Value **argv) {
+    if (argc < 1 || argc > 2) runtime_error(NULL, "自然对数函数需要1-2个参数");
+    double x = num_of(argv[0], "自然对数");
+    if (x <= 0) runtime_error(NULL, "自然对数的参数必须大于 0");
+    if (argc == 2) {
+        double b = num_of(argv[1], "自然对数");
+        if (b <= 0 || fabs(b - 1.0) < 1e-12) runtime_error(NULL, "对数的底必须大于 0 且不等于 1");
+        return val_flt(log(x) / log(b));
     }
-    Value *r = val_new(VAL_FLOAT);
-    r->fval = m;
-    return r;
+    return val_flt(log(x));
+}
+static Value *builtin_pi(int argc, Value **argv) {
+    (void)argc; (void)argv;
+    return val_flt(3.14159265358979323846);
+}
+static Value *builtin_sign(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "符号函数需要1个参数");
+    double x = num_of(argv[0], "符号");
+    return val_int(x > 0 ? 1 : (x < 0 ? -1 : 0));
+}
+/* 随机整数：随机整数(a, b) 返回 [a, b] 闭区间内均匀整数 */
+static Value *builtin_rand_int(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "随机整数函数需要2个参数");
+    long a = (long)num_of(argv[0], "随机整数"), b = (long)num_of(argv[1], "随机整数");
+    if (a > b) { long t = a; a = b; b = t; }
+    long span = b - a + 1;
+    return val_int(a + (long)((double)rand() / ((double)RAND_MAX + 1.0) * (double)span));
 }
 
 /* 列表函数 */
@@ -1404,59 +2113,455 @@ static Value *builtin_append(int argc, Value **argv) {
     list->lval = new_list;
     list->lval[list->list_len] = val_retain(item);
     list->list_len++;
-    return val_new(VAL_NULL);
+    return val_retain(list);   /* 返回列表本身：既保留原地语义，又支持链式调用 */
 }
 
 static Value *builtin_remove(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "删除函数需要2个参数");
     if (argv[0]->type != VAL_LIST) runtime_error(NULL, "删除函数的第一个参数必须是列表");
-    if (argv[1]->type != VAL_INT) runtime_error(NULL, "删除函数的第二个参数必须是整数索引");
     Value *list = argv[0];
-    int idx = (int)argv[1]->ival;
-    if (idx < 0 || idx >= list->list_len) runtime_error(NULL, "列表索引越界");
+    long i0 = (long)num_of(argv[1], "删除"), idx = i0;
+    if (idx < 0) idx += list->list_len;   /* 负索引：-1 表示最后一个，与索引/切片/插入一致 */
+    if (idx < 0 || idx >= list->list_len)
+        runtime_error(NULL, "列表索引越界: %ld（列表长度 %d）", i0, list->list_len);
     val_free(list->lval[idx]);
-    for (int i = idx; i < list->list_len - 1; i++) {
+    for (long i = idx; i < list->list_len - 1; i++) {
         list->lval[i] = list->lval[i + 1];
     }
     list->list_len--;
-    return val_new(VAL_NULL);
+    return val_retain(list);
+}
+
+/* 通用值比较：数字按数值、字符串按字典序、其余按类型序，返回 <0 / 0 / >0 */
+/* 是否可当作数值参与比较（布尔按 0/1 计入，便于 真 == 1 这类互操作） */
+static int is_numeric_val(Value *v) {
+    return v->type == VAL_INT || v->type == VAL_FLOAT || v->type == VAL_BOOL;
+}
+static double numeric_of(Value *v) {
+    if (v->type == VAL_FLOAT) return v->fval;
+    return (double)v->ival;   /* VAL_INT / VAL_BOOL 共用 ival */
+}
+
+static int val_cmp(Value *a, Value *b) {
+    if (is_numeric_val(a) && is_numeric_val(b)) {
+        double x = numeric_of(a), y = numeric_of(b);
+        return (x < y) ? -1 : ((x > y) ? 1 : 0);
+    }
+    if (a->type == VAL_STRING && b->type == VAL_STRING)
+        return strcmp(a->sval ? a->sval : "", b->sval ? b->sval : "");
+    /* 同为列表：逐元素字典序比较，长度短者在前（前缀关系） */
+    if (a->type == VAL_LIST && b->type == VAL_LIST) {
+        int n = a->list_len < b->list_len ? a->list_len : b->list_len;
+        for (int i = 0; i < n; i++) {
+            int c = val_cmp(a->lval[i], b->lval[i]);
+            if (c) return c;
+        }
+        return (a->list_len < b->list_len) ? -1 : ((a->list_len > b->list_len) ? 1 : 0);
+    }
+    /* 类型不同：按枚举序稳定排列，保证排序是全序，不会读错联合体成员 */
+    return (a->type < b->type) ? -1 : ((a->type > b->type) ? 1 : 0);
+}
+
+/* 值相等判断（整数/浮点/布尔跨类型可比；容器按结构递归比较） */
+static int val_equals(Value *a, Value *b) {
+    if (!a || !b) return a == b;
+    if (is_numeric_val(a) && is_numeric_val(b))
+        return fabs(numeric_of(a) - numeric_of(b)) < 1e-12;
+    if (a->type != b->type) return 0;
+    switch (a->type) {
+        case VAL_NULL:   return 1;
+        case VAL_STRING: return strcmp(a->sval ? a->sval : "", b->sval ? b->sval : "") == 0;
+        case VAL_LIST:
+            if (a->list_len != b->list_len) return 0;
+            for (int i = 0; i < a->list_len; i++)
+                if (!val_equals(a->lval[i], b->lval[i])) return 0;
+            return 1;
+        case VAL_MAP: {
+            /* 字典相等：键集合与对应值都相等（键顺序无关） */
+            if (a->mval->count != b->mval->count) return 0;
+            for (int i = 0; i < MAX_DICT_SIZE; i++) {
+                if (!a->mval->entries[i].used) continue;
+                Value *bv = dict_get(b->mval, a->mval->entries[i].key);
+                if (!bv || !val_equals(a->mval->entries[i].val, bv)) return 0;
+            }
+            return 1;
+        }
+        case VAL_TENSOR: {
+            Tensor *x = a->tval, *y = b->tval;
+            if (x == y) return 1;
+            if (!x || !y || x->size != y->size || x->ndim != y->ndim) return 0;
+            for (int i = 0; i < x->ndim; i++) if (x->shape[i] != y->shape[i]) return 0;
+            for (int i = 0; i < x->size; i++) if (fabsf(x->data[i] - y->data[i]) > 1e-6f) return 0;
+            return 1;
+        }
+        default: return a == b;
+    }
+}
+
+/* 归并排序：稳定 O(n log n)，取代原本只能比数字的冒泡 */
+static void val_msort(Value **arr, Value **tmp, int lo, int hi, int desc) {
+    if (hi - lo < 2) return;
+    int mid = lo + (hi - lo) / 2;
+    val_msort(arr, tmp, lo, mid, desc);
+    val_msort(arr, tmp, mid, hi, desc);
+    int i = lo, j = mid, k = lo;
+    while (i < mid && j < hi) {
+        int c = val_cmp(arr[i], arr[j]);
+        if (desc) c = -c;
+        tmp[k++] = (c <= 0) ? arr[i++] : arr[j++];   /* <= 保证稳定 */
+    }
+    while (i < mid) tmp[k++] = arr[i++];
+    while (j < hi)  tmp[k++] = arr[j++];
+    for (int t = lo; t < hi; t++) arr[t] = tmp[t];
 }
 
 static Value *builtin_sort(int argc, Value **argv) {
-    if (argc != 1) runtime_error(NULL, "排序函数需要1个参数");
-    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "排序函数的参数必须是列表");
+    if (argc < 1 || argc > 2) runtime_error(NULL, "排序函数需要1-2个参数（列表[, 是否降序]）");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "排序函数的第一个参数必须是列表");
     Value *list = argv[0];
-    for (int i = 0; i < list->list_len - 1; i++) {
-        for (int j = 0; j < list->list_len - i - 1; j++) {
-            double a = (list->lval[j]->type == VAL_FLOAT) ? list->lval[j]->fval : list->lval[j]->ival;
-            double b = (list->lval[j+1]->type == VAL_FLOAT) ? list->lval[j+1]->fval : list->lval[j+1]->ival;
-            if (a > b) {
-                Value *tmp = list->lval[j];
-                list->lval[j] = list->lval[j+1];
-                list->lval[j+1] = tmp;
-            }
+    int desc = 0;
+    if (argc == 2) desc = truthy(argv[1]);
+    if (list->list_len > 1) {
+        Value **tmp = malloc(list->list_len * sizeof(Value*));
+        if (!tmp) runtime_error(NULL, "排序时内存不足");
+        val_msort(list->lval, tmp, 0, list->list_len, desc);
+        free(tmp);
+    }
+    return val_retain(list);
+}
+
+/* ---------- 新增列表函数 ---------- */
+static Value *list_new_empty(void) {
+    Value *r = val_new(VAL_LIST);
+    r->list_len = 0;
+    r->lval = malloc(sizeof(Value*));
+    if (!r->lval) runtime_error(NULL, "创建列表时内存不足");
+    return r;
+}
+static void list_push(Value *list, Value *item /* 借用，内部 retain */) {
+    Value **nl = realloc(list->lval, (list->list_len + 1) * sizeof(Value*));
+    if (!nl) runtime_error(NULL, "列表扩容时内存不足");
+    list->lval = nl;
+    list->lval[list->list_len++] = val_retain(item);
+}
+
+/* 范围(n) -> [0..n-1]；范围(a,b) -> [a..b-1]；范围(a,b,步长) */
+static Value *builtin_range(int argc, Value **argv) {
+    if (argc < 1 || argc > 3) runtime_error(NULL, "范围函数需要1-3个参数");
+    long a = 0, b = 0, s = 1;
+    if (argc == 1) { b = (long)num_of(argv[0], "范围"); }
+    else {
+        a = (long)num_of(argv[0], "范围");
+        b = (long)num_of(argv[1], "范围");
+        if (argc == 3) s = (long)num_of(argv[2], "范围");
+    }
+    if (s == 0) runtime_error(NULL, "范围的步长不能为 0");
+    Value *r = list_new_empty();
+    if (s > 0) for (long i = a; i < b; i += s) { Value *v = val_int(i); list_push(r, v); val_free(v); }
+    else       for (long i = a; i > b; i += s) { Value *v = val_int(i); list_push(r, v); val_free(v); }
+    return r;
+}
+
+static Value *builtin_reverse(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "反转函数需要1个参数");
+    if (argv[0]->type == VAL_STRING) {
+        /* 按字符反转（UTF-8 安全） */
+        const char *s = argv[0]->sval ? argv[0]->sval : "";
+        long n = utf8_strlen(s);
+        SBuf sb; sb_init(&sb);
+        for (long i = n - 1; i >= 0; i--) {
+            char *ch = utf8_char_at(s, i);
+            sb_append(&sb, ch);
+            free(ch);
         }
+        Value *r = val_new(VAL_STRING);
+        r->sval = sb.buf;
+        return r;
+    }
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "反转函数的参数必须是列表或字符串");
+    Value *l = argv[0];
+    for (int i = 0, j = l->list_len - 1; i < j; i++, j--) {
+        Value *t = l->lval[i]; l->lval[i] = l->lval[j]; l->lval[j] = t;
     }
     return val_new(VAL_NULL);
+}
+
+/* 索引(列表, 元素) -> 首次出现的下标，找不到返回 -1 */
+static Value *builtin_index_of(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "索引函数需要2个参数");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "索引函数的第一个参数必须是列表");
+    for (int i = 0; i < argv[0]->list_len; i++)
+        if (val_equals(argv[0]->lval[i], argv[1])) return val_int(i);
+    return val_int(-1);
+}
+
+/* 插入(列表, 下标, 元素)：下标支持负数与末尾追加 */
+static Value *builtin_insert(int argc, Value **argv) {
+    if (argc != 3) runtime_error(NULL, "插入函数需要3个参数");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "插入函数的第一个参数必须是列表");
+    Value *l = argv[0];
+    long idx = (long)num_of(argv[1], "插入");
+    if (idx < 0) idx += l->list_len;
+    if (idx < 0) idx = 0;
+    if (idx > l->list_len) idx = l->list_len;
+    Value **nl = realloc(l->lval, (l->list_len + 1) * sizeof(Value*));
+    if (!nl) runtime_error(NULL, "插入时内存不足");
+    l->lval = nl;
+    for (long i = l->list_len; i > idx; i--) l->lval[i] = l->lval[i-1];
+    l->lval[idx] = val_retain(argv[2]);
+    l->list_len++;
+    return val_retain(l);
+}
+
+/* 弹出(列表[, 下标]) -> 被移除的元素，默认末尾 */
+static Value *builtin_pop(int argc, Value **argv) {
+    if (argc < 1 || argc > 2) runtime_error(NULL, "弹出函数需要1-2个参数");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "弹出函数的第一个参数必须是列表");
+    Value *l = argv[0];
+    if (l->list_len == 0) runtime_error(NULL, "无法从空列表弹出元素");
+    long idx = (argc == 2) ? (long)num_of(argv[1], "弹出") : l->list_len - 1;
+    if (idx < 0) idx += l->list_len;
+    if (idx < 0 || idx >= l->list_len) runtime_error(NULL, "弹出的下标越界");
+    Value *out = l->lval[idx];              /* 引用移交给调用方，不再 retain */
+    for (long i = idx; i < l->list_len - 1; i++) l->lval[i] = l->lval[i+1];
+    l->list_len--;
+    return out;
+}
+
+/* 唯一(列表) -> 新列表，保持首次出现顺序 */
+static Value *builtin_unique(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "唯一函数需要1个参数");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "唯一函数的参数必须是列表");
+    Value *r = list_new_empty();
+    for (int i = 0; i < argv[0]->list_len; i++) {
+        int dup = 0;
+        for (int j = 0; j < r->list_len; j++)
+            if (val_equals(r->lval[j], argv[0]->lval[i])) { dup = 1; break; }
+        if (!dup) list_push(r, argv[0]->lval[i]);
+    }
+    return r;
+}
+
+/* 计数(列表|字符串, 目标) -> 出现次数 */
+static Value *builtin_count(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "计数函数需要2个参数");
+    if (argv[0]->type == VAL_STRING) {
+        if (argv[1]->type != VAL_STRING) runtime_error(NULL, "在字符串中计数时第二个参数必须是字符串");
+        const char *s = argv[0]->sval ? argv[0]->sval : "";
+        const char *t = argv[1]->sval ? argv[1]->sval : "";
+        if (!*t) runtime_error(NULL, "计数的目标不能是空字符串");
+        long c = 0;
+        size_t tl = strlen(t);
+        for (const char *p = s; (p = strstr(p, t)) != NULL; p += tl) c++;
+        return val_int(c);
+    }
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "计数函数的第一个参数必须是列表或字符串");
+    long c = 0;
+    for (int i = 0; i < argv[0]->list_len; i++)
+        if (val_equals(argv[0]->lval[i], argv[1])) c++;
+    return val_int(c);
+}
+
+/* 切片(列表|字符串, 起, 止) -> 新列表/新串，支持负索引，止为开区间 */
+static Value *builtin_slice(int argc, Value **argv) {
+    if (argc < 2 || argc > 3) runtime_error(NULL, "切片函数需要2-3个参数");
+    if (argv[0]->type == VAL_STRING) {
+        const char *s = argv[0]->sval ? argv[0]->sval : "";
+        long n = utf8_strlen(s);
+        long a = (long)num_of(argv[1], "切片");
+        long b = (argc == 3) ? (long)num_of(argv[2], "切片") : n;
+        if (a < 0) a += n;
+        if (b < 0) b += n;
+        if (a < 0) a = 0;
+        if (b > n) b = n;
+        Value *r = val_new(VAL_STRING);
+        r->sval = (b > a) ? utf8_substr(s, a, b - a) : strdup("");
+        return r;
+    }
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "切片函数的第一个参数必须是列表或字符串");
+    Value *l = argv[0];
+    long n = l->list_len;
+    long a = (long)num_of(argv[1], "切片");
+    long b = (argc == 3) ? (long)num_of(argv[2], "切片") : n;
+    if (a < 0) a += n;
+    if (b < 0) b += n;
+    if (a < 0) a = 0;
+    if (b > n) b = n;
+    Value *r = list_new_empty();
+    for (long i = a; i < b; i++) list_push(r, l->lval[i]);
+    return r;
+}
+
+/* 扁平(嵌套列表) -> 一层展开 */
+static Value *builtin_flatten(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "扁平函数需要1个参数");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "扁平函数的参数必须是列表");
+    Value *r = list_new_empty();
+    for (int i = 0; i < argv[0]->list_len; i++) {
+        Value *e = argv[0]->lval[i];
+        if (e->type == VAL_LIST) for (int j = 0; j < e->list_len; j++) list_push(r, e->lval[j]);
+        else list_push(r, e);
+    }
+    return r;
+}
+
+/* 累加(列表) -> 数值和；全整数返回整数 */
+static Value *builtin_total(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "累加函数需要1个参数");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "累加函数的参数必须是列表");
+    double s = 0; int all_int = 1;
+    for (int i = 0; i < argv[0]->list_len; i++) {
+        s += num_of(argv[0]->lval[i], "累加");
+        if (argv[0]->lval[i]->type != VAL_INT) all_int = 0;
+    }
+    return all_int ? val_int((long)s) : val_flt(s);
+}
+
+/* ---------- 字典函数 ---------- */
+static Value *builtin_keys(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "键函数需要1个参数");
+    if (argv[0]->type != VAL_MAP) runtime_error(NULL, "键函数的参数必须是字典");
+    Value *r = list_new_empty();
+    for (int i = 0; i < MAX_DICT_SIZE; i++) {
+        if (!argv[0]->mval->entries[i].used) continue;
+        Value *k = val_new(VAL_STRING);
+        k->sval = strdup(argv[0]->mval->entries[i].key);
+        list_push(r, k);
+        val_free(k);
+    }
+    return r;
+}
+static Value *builtin_values(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "值函数需要1个参数");
+    if (argv[0]->type != VAL_MAP) runtime_error(NULL, "值函数的参数必须是字典");
+    Value *r = list_new_empty();
+    for (int i = 0; i < MAX_DICT_SIZE; i++) {
+        if (!argv[0]->mval->entries[i].used) continue;
+        list_push(r, argv[0]->mval->entries[i].val);
+    }
+    return r;
+}
+static Value *builtin_del_key(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "移除键函数需要2个参数");
+    if (argv[0]->type != VAL_MAP) runtime_error(NULL, "移除键函数的第一个参数必须是字典");
+    if (argv[1]->type != VAL_STRING) runtime_error(NULL, "字典键必须是字符串");
+    return val_int(dict_remove(argv[0]->mval, argv[1]->sval));
+}
+/* 项(字典) -> [[键, 值], ...]，便于用 对于 遍历 */
+static Value *builtin_items(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "项函数需要1个参数");
+    if (argv[0]->type != VAL_MAP) runtime_error(NULL, "项函数的参数必须是字典");
+    Value *r = list_new_empty();
+    for (int i = 0; i < MAX_DICT_SIZE; i++) {
+        if (!argv[0]->mval->entries[i].used) continue;
+        Value *pair = list_new_empty();
+        Value *k = val_new(VAL_STRING);
+        k->sval = strdup(argv[0]->mval->entries[i].key);
+        list_push(pair, k);
+        val_free(k);
+        list_push(pair, argv[0]->mval->entries[i].val);
+        list_push(r, pair);
+        val_free(pair);
+    }
+    return r;
+}
+
+/* ---------- 高阶函数：映射 / 过滤 / 归约 / 全部满足 / 任一满足 ----------
+   由解释器在定义 eval 之后注入回调，使内置函数能调用用户自定义函数。 */
+static Value *(*g_call_fn)(Value *fnval, Value **args, int argc) = NULL;
+
+static Value *hof_call1(Value *fn, Value *a) {
+    if (!g_call_fn) runtime_error(NULL, "内部错误: 函数调用回调未初始化");
+    Value *args[1] = { a };
+    return g_call_fn(fn, args, 1);
+}
+static Value *builtin_map_fn(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "映射函数需要2个参数（列表, 函数）");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "映射函数的第一个参数必须是列表");
+    if (argv[1]->type != VAL_FUNC) runtime_error(NULL, "映射函数的第二个参数必须是函数");
+    Value *r = list_new_empty();
+    for (int i = 0; i < argv[0]->list_len; i++) {
+        Value *out = hof_call1(argv[1], argv[0]->lval[i]);
+        list_push(r, out);
+        val_free(out);
+    }
+    return r;
+}
+static Value *builtin_filter_fn(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "过滤函数需要2个参数（列表, 函数）");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "过滤函数的第一个参数必须是列表");
+    if (argv[1]->type != VAL_FUNC) runtime_error(NULL, "过滤函数的第二个参数必须是函数");
+    Value *r = list_new_empty();
+    for (int i = 0; i < argv[0]->list_len; i++) {
+        Value *keep = hof_call1(argv[1], argv[0]->lval[i]);
+        int ok = truthy(keep);
+        val_free(keep);
+        if (ok) list_push(r, argv[0]->lval[i]);
+    }
+    return r;
+}
+static Value *builtin_reduce_fn(int argc, Value **argv) {
+    if (argc < 2 || argc > 3) runtime_error(NULL, "归约函数需要2-3个参数（列表, 函数[, 初值]）");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "归约函数的第一个参数必须是列表");
+    if (argv[1]->type != VAL_FUNC) runtime_error(NULL, "归约函数的第二个参数必须是函数");
+    if (!g_call_fn) runtime_error(NULL, "内部错误: 函数调用回调未初始化");
+    Value *acc = NULL;
+    int start = 0;
+    if (argc == 3) acc = val_retain(argv[2]);
+    else {
+        if (argv[0]->list_len == 0) runtime_error(NULL, "对空列表归约时必须提供初值");
+        acc = val_retain(argv[0]->lval[0]);
+        start = 1;
+    }
+    for (int i = start; i < argv[0]->list_len; i++) {
+        Value *args[2] = { acc, argv[0]->lval[i] };
+        Value *next = g_call_fn(argv[1], args, 2);
+        val_free(acc);
+        acc = next;
+    }
+    return acc;
+}
+static Value *builtin_all_fn(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "全部满足函数需要2个参数（列表, 函数）");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "全部满足函数的第一个参数必须是列表");
+    if (argv[1]->type != VAL_FUNC) runtime_error(NULL, "全部满足函数的第二个参数必须是函数");
+    for (int i = 0; i < argv[0]->list_len; i++) {
+        Value *v = hof_call1(argv[1], argv[0]->lval[i]);
+        int ok = truthy(v);
+        val_free(v);
+        if (!ok) return val_bool(0);
+    }
+    return val_bool(1);
+}
+static Value *builtin_any_fn(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "任一满足函数需要2个参数（列表, 函数）");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "任一满足函数的第一个参数必须是列表");
+    if (argv[1]->type != VAL_FUNC) runtime_error(NULL, "任一满足函数的第二个参数必须是函数");
+    for (int i = 0; i < argv[0]->list_len; i++) {
+        Value *v = hof_call1(argv[1], argv[0]->lval[i]);
+        int ok = truthy(v);
+        val_free(v);
+        if (ok) return val_bool(1);
+    }
+    return val_bool(0);
 }
 
 static Value *builtin_contains(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "包含函数需要2个参数");
-    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "包含函数的第一个参数必须是列表");
-    Value *list = argv[0];
-    Value *item = argv[1];
-    Value *r = val_new(VAL_INT);
-    r->ival = 0;
-    for (int i = 0; i < list->list_len; i++) {
-        int match = 0;
-        if (list->lval[i]->type == item->type) {
-            if (item->type == VAL_INT && list->lval[i]->ival == item->ival) match = 1;
-            else if (item->type == VAL_FLOAT && list->lval[i]->fval == item->fval) match = 1;
-            else if (item->type == VAL_STRING && strcmp(list->lval[i]->sval, item->sval) == 0) match = 1;
-        }
-        if (match) { r->ival = 1; break; }
+    /* 统一的成员判断：字符串查子串、字典查键、列表查元素 */
+    if (argv[0]->type == VAL_STRING) {
+        if (argv[1]->type != VAL_STRING) runtime_error(NULL, "在字符串中查找时第二个参数必须是字符串");
+        return val_bool(strstr(argv[0]->sval, argv[1]->sval) != NULL);
     }
-    return r;
+    if (argv[0]->type == VAL_MAP) {
+        if (argv[1]->type != VAL_STRING) runtime_error(NULL, "字典键必须是字符串");
+        return val_bool(dict_get(argv[0]->mval, argv[1]->sval) != NULL);
+    }
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "包含函数的第一个参数必须是列表、字符串或字典");
+    /* 元素判等统一走 val_equals：支持嵌套列表/字典/布尔，而非只比三种标量 */
+    for (int i = 0; i < argv[0]->list_len; i++)
+        if (val_equals(argv[0]->lval[i], argv[1])) return val_bool(1);
+    return val_bool(0);
 }
 
 /* 字符串函数 */
@@ -1466,20 +2571,35 @@ static Value *builtin_split(int argc, Value **argv) {
     Value *str = argv[0];
     const char *sep = (argc >= 2 && argv[1]->type == VAL_STRING) ? argv[1]->sval : " ";
     
-    Value *result = val_new(VAL_LIST);
-    result->list_len = 0;
-    result->lval = malloc(sizeof(Value*));
-    
-    char *copy = strdup(str->sval);
-    char *token = strtok(copy, sep);
-    while (token) {
-        result->list_len++;
-        result->lval = realloc(result->lval, result->list_len * sizeof(Value*));
-        result->lval[result->list_len - 1] = val_new(VAL_STRING);
-        result->lval[result->list_len - 1]->sval = strdup(token);
-        token = strtok(NULL, sep);
+    /* 按【完整子串】切分，而非 strtok 的“字符集合”语义
+       —— 这对多字节分隔符（如 "、"）是必须的，否则会按字节乱切 */
+    Value *result = list_new_empty();
+    const char *s = str->sval ? str->sval : "";
+    size_t sl = strlen(sep);
+    if (sl == 0) {
+        /* 空分隔符：逐字符拆分（UTF-8 安全） */
+        long n = utf8_strlen(s);
+        for (long i = 0; i < n; i++) {
+            Value *e = val_new(VAL_STRING);
+            e->sval = utf8_char_at(s, i);
+            list_push(result, e);
+            val_free(e);
+        }
+        return result;
     }
-    free(copy);
+    const char *p = s;
+    while (1) {
+        const char *q = strstr(p, sep);
+        size_t seg = q ? (size_t)(q - p) : strlen(p);
+        Value *e = val_new(VAL_STRING);
+        e->sval = malloc(seg + 1);
+        memcpy(e->sval, p, seg);
+        e->sval[seg] = '\0';
+        list_push(result, e);
+        val_free(e);
+        if (!q) break;
+        p = q + sl;
+    }
     return result;
 }
 
@@ -1488,28 +2608,16 @@ static Value *builtin_join(int argc, Value **argv) {
     if (argv[0]->type != VAL_LIST) runtime_error(NULL, "连接函数的第一个参数必须是列表");
     if (argv[1]->type != VAL_STRING) runtime_error(NULL, "连接函数的第二个参数必须是字符串");
     Value *list = argv[0];
-    const char *sep = argv[1]->sval;
-    
-    size_t total_len = 1;
+    const char *sep = argv[1]->sval ? argv[1]->sval : "";
+    /* 用动态缓冲：空列表不再 size_t 下溢，非字符串元素自动转字符串 */
+    SBuf sb;
+    sb_init(&sb);
     for (int i = 0; i < list->list_len; i++) {
-        if (list->lval[i]->type == VAL_STRING) {
-            total_len += strlen(list->lval[i]->sval);
-        }
+        if (i) sb_append(&sb, sep);
+        val_to_sbuf(list->lval[i], &sb);
     }
-    total_len += (list->list_len - 1) * strlen(sep);
-    
     Value *result = val_new(VAL_STRING);
-    result->sval = malloc(total_len);
-    result->sval[0] = '\0';
-    
-    for (int i = 0; i < list->list_len; i++) {
-        if (list->lval[i]->type == VAL_STRING) {
-            strcat(result->sval, list->lval[i]->sval);
-        }
-        if (i < list->list_len - 1) {
-            strcat(result->sval, sep);
-        }
-    }
+    result->sval = sb.buf;
     return result;
 }
 
@@ -1518,27 +2626,28 @@ static Value *builtin_replace(int argc, Value **argv) {
     if (argv[0]->type != VAL_STRING) runtime_error(NULL, "替换函数的第一个参数必须是字符串");
     if (argv[1]->type != VAL_STRING || argv[2]->type != VAL_STRING) runtime_error(NULL, "替换函数的第二、三个参数必须是字符串");
     
-    Value *result = val_new(VAL_STRING);
-    size_t len = strlen(argv[0]->sval) * 2 + 1;
-    result->sval = malloc(len);
-    
-    const char *src = argv[0]->sval;
-    const char *old = argv[1]->sval;
-    const char *new = argv[2]->sval;
+    const char *src = argv[0]->sval ? argv[0]->sval : "";
+    const char *old = argv[1]->sval ? argv[1]->sval : "";
+    const char *rep = argv[2]->sval ? argv[2]->sval : "";
     size_t old_len = strlen(old);
-    
-    char *dest = result->sval;
+    /* 空的被替换串会造成死循环，明确报错而不是挂死 */
+    if (old_len == 0) runtime_error(NULL, "替换函数的被替换串不能为空");
+
+    /* 动态缓冲：替换串比原串长时不再溢出（原实现按 2 倍预估，会写越界） */
+    SBuf sb;
+    sb_init(&sb);
     const char *p = src;
     while (*p) {
         if (strncmp(p, old, old_len) == 0) {
-            strcpy(dest, new);
-            dest += strlen(new);
+            sb_append(&sb, rep);
             p += old_len;
         } else {
-            *dest++ = *p++;
+            char one[2] = { *p++, '\0' };
+            sb_append(&sb, one);
         }
     }
-    *dest = '\0';
+    Value *result = val_new(VAL_STRING);
+    result->sval = sb.buf;
     return result;
 }
 
@@ -1548,7 +2657,8 @@ static Value *builtin_find(int argc, Value **argv) {
     
     Value *result = val_new(VAL_INT);
     char *p = strstr(argv[0]->sval, argv[1]->sval);
-    result->ival = p ? (int)(p - argv[0]->sval) : -1;
+    /* 返回字符下标而非字节偏移，与 长度/截取/下标 保持同一坐标系 */
+    result->ival = p ? utf8_char_index(argv[0]->sval, (long)(p - argv[0]->sval)) : -1;
     return result;
 }
 
@@ -1557,21 +2667,188 @@ static Value *builtin_substring(int argc, Value **argv) {
     if (argv[0]->type != VAL_STRING) runtime_error(NULL, "截取函数的第一个参数必须是字符串");
     if (argv[1]->type != VAL_INT || argv[2]->type != VAL_INT) runtime_error(NULL, "截取函数的后两个参数必须是整数");
     
-    int start = (int)argv[1]->ival;
-    int len = (int)argv[2]->ival;
-    const char *s = argv[0]->sval;
-    int slen = strlen(s);
-    
-    if (start < 0) start = 0;
-    if (start >= slen) start = slen - 1;
-    if (len < 0) len = 0;
-    if (start + len > slen) len = slen - start;
-    
+    /* 按【字符】截取，支持负起点（-1 表示最后一个字符） */
     Value *result = val_new(VAL_STRING);
-    result->sval = malloc(len + 1);
-    strncpy(result->sval, s + start, len);
-    result->sval[len] = '\0';
+    result->sval = utf8_substr(argv[0]->sval, argv[1]->ival, argv[2]->ival);
     return result;
+}
+
+/* ---------- 新增字符串函数 ---------- */
+static const char *str_arg(Value *v, const char *who) {
+    if (v->type != VAL_STRING) runtime_error(NULL, "%s 需要字符串参数", who);
+    return v->sval ? v->sval : "";
+}
+
+/* 去空白 / 去左空白 / 去右空白 */
+static Value *str_trim_impl(const char *s, int left, int right) {
+    const char *a = s;
+    const char *b = s + strlen(s);
+    if (left)  while (a < b && (unsigned char)*a <= ' ') a++;
+    if (right) while (b > a && (unsigned char)*(b-1) <= ' ') b--;
+    Value *r = val_new(VAL_STRING);
+    size_t n = (size_t)(b - a);
+    r->sval = malloc(n + 1);
+    memcpy(r->sval, a, n);
+    r->sval[n] = '\0';
+    return r;
+}
+static Value *builtin_trim(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "去空白函数需要1个参数");
+    return str_trim_impl(str_arg(argv[0], "去空白"), 1, 1);
+}
+static Value *builtin_ltrim(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "去左空白函数需要1个参数");
+    return str_trim_impl(str_arg(argv[0], "去左空白"), 1, 0);
+}
+static Value *builtin_rtrim(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "去右空白函数需要1个参数");
+    return str_trim_impl(str_arg(argv[0], "去右空白"), 0, 1);
+}
+
+/* 大写 / 小写：只改 ASCII 字母，多字节字符原样保留（不破坏 UTF-8） */
+static Value *str_case_impl(const char *s, int up) {
+    Value *r = val_new(VAL_STRING);
+    r->sval = strdup(s);
+    for (char *p = r->sval; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x80) *p = up ? (char)toupper(c) : (char)tolower(c);
+    }
+    return r;
+}
+static Value *builtin_upper(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "大写函数需要1个参数");
+    return str_case_impl(str_arg(argv[0], "大写"), 1);
+}
+static Value *builtin_lower(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "小写函数需要1个参数");
+    return str_case_impl(str_arg(argv[0], "小写"), 0);
+}
+
+/* 重复(串, 次数) */
+static Value *builtin_repeat(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "重复函数需要2个参数");
+    const char *s = str_arg(argv[0], "重复");
+    long n = (long)num_of(argv[1], "重复");
+    if (n < 0) runtime_error(NULL, "重复次数不能为负数");
+    SBuf sb; sb_init(&sb);
+    for (long i = 0; i < n; i++) sb_append(&sb, s);
+    Value *r = val_new(VAL_STRING);
+    r->sval = sb.buf;
+    return r;
+}
+
+/* 开头是(串, 前缀) / 结尾是(串, 后缀) */
+static Value *builtin_startswith(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "开头是函数需要2个参数");
+    const char *s = str_arg(argv[0], "开头是"), *p = str_arg(argv[1], "开头是");
+    return val_bool(strncmp(s, p, strlen(p)) == 0);
+}
+static Value *builtin_endswith(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "结尾是函数需要2个参数");
+    const char *s = str_arg(argv[0], "结尾是"), *p = str_arg(argv[1], "结尾是");
+    size_t ls = strlen(s), lp = strlen(p);
+    return val_bool(lp <= ls && strcmp(s + ls - lp, p) == 0);
+}
+
+/* 字符码(串[, 下标]) -> Unicode 码点；码转字符(码点) -> 串 */
+static Value *builtin_char_code(int argc, Value **argv) {
+    if (argc < 1 || argc > 2) runtime_error(NULL, "字符码函数需要1-2个参数");
+    const char *s = str_arg(argv[0], "字符码");
+    long idx = (argc == 2) ? (long)num_of(argv[1], "字符码") : 0;
+    char *ch = utf8_char_at(s, idx);
+    if (!ch) runtime_error(NULL, "字符码的下标越界");
+    unsigned char c0 = (unsigned char)ch[0];
+    long cp;
+    int n = utf8_seq_len(c0);
+    if (n == 1) cp = c0;
+    else if (n == 2) cp = ((c0 & 0x1F) << 6) | ((unsigned char)ch[1] & 0x3F);
+    else if (n == 3) cp = ((c0 & 0x0F) << 12) | (((unsigned char)ch[1] & 0x3F) << 6) | ((unsigned char)ch[2] & 0x3F);
+    else cp = ((long)(c0 & 0x07) << 18) | (((unsigned char)ch[1] & 0x3F) << 12) |
+              (((unsigned char)ch[2] & 0x3F) << 6) | ((unsigned char)ch[3] & 0x3F);
+    free(ch);
+    return val_int(cp);
+}
+static Value *builtin_from_code(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "码转字符函数需要1个参数");
+    long cp = (long)num_of(argv[0], "码转字符");
+    if (cp < 0 || cp > 0x10FFFF) runtime_error(NULL, "码点超出 Unicode 范围");
+    char b[5]; int n;
+    if (cp < 0x80)        { b[0] = (char)cp; n = 1; }
+    else if (cp < 0x800)  { b[0] = (char)(0xC0 | (cp >> 6));  b[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000){ b[0] = (char)(0xE0 | (cp >> 12)); b[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            b[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
+    else                  { b[0] = (char)(0xF0 | (cp >> 18)); b[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                            b[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
+    b[n] = '\0';
+    Value *r = val_new(VAL_STRING);
+    r->sval = strdup(b);
+    return r;
+}
+
+/* ---------- 文件读写：通用语言的基本能力 ---------- */
+static Value *builtin_read_file(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "读文件函数需要1个参数（路径）");
+    const char *path = str_arg(argv[0], "读文件");
+    FILE *f = fopen(path, "rb");
+    if (!f) runtime_error(NULL, "无法打开文件: %s", path);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); runtime_error(NULL, "无法定位文件末尾: %s", path); }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); runtime_error(NULL, "无法获取文件大小: %s", path); }
+    rewind(f);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); runtime_error(NULL, "读取文件时内存不足"); }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[got] = '\0';
+    Value *r = val_new(VAL_STRING);
+    r->sval = buf;
+    return r;
+}
+static Value *file_write_impl(int argc, Value **argv, const char *mode, const char *who) {
+    if (argc != 2) runtime_error(NULL, "%s函数需要2个参数（路径, 内容）", who);
+    const char *path = str_arg(argv[0], who);
+    char *content = val_to_string(argv[1]);
+    FILE *f = fopen(path, mode);
+    if (!f) { free(content); runtime_error(NULL, "无法写入文件: %s", path); }
+    size_t n = strlen(content);
+    size_t w = fwrite(content, 1, n, f);
+    int cerr = fclose(f);
+    free(content);
+    if (w != n || cerr != 0) runtime_error(NULL, "写入文件未完成: %s", path);
+    return val_int((long)n);
+}
+static Value *builtin_write_file(int argc, Value **argv)  { return file_write_impl(argc, argv, "wb", "写文件"); }
+static Value *builtin_append_file(int argc, Value **argv) { return file_write_impl(argc, argv, "ab", "追加文件"); }
+static Value *builtin_file_exists(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "文件存在函数需要1个参数");
+    FILE *f = fopen(str_arg(argv[0], "文件存在"), "rb");
+    if (f) { fclose(f); return val_bool(1); }
+    return val_bool(0);
+}
+static Value *builtin_delete_file(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "删除文件函数需要1个参数");
+    return val_bool(remove(str_arg(argv[0], "删除文件")) == 0);
+}
+/* 读取行(路径) -> 行列表（去掉行尾换行） */
+static Value *builtin_read_lines(int argc, Value **argv) {
+    Value *whole = builtin_read_file(argc, argv);
+    Value *r = list_new_empty();
+    const char *p = whole->sval;
+    while (*p) {
+        const char *q = strchr(p, '\n');
+        size_t n = q ? (size_t)(q - p) : strlen(p);
+        if (n > 0 && p[n-1] == '\r') n--;          /* 兼容 CRLF */
+        Value *e = val_new(VAL_STRING);
+        e->sval = malloc(n + 1);
+        memcpy(e->sval, p, n);
+        e->sval[n] = '\0';
+        list_push(r, e);
+        val_free(e);
+        if (!q) break;
+        p = q + 1;
+    }
+    val_free(whole);
+    return r;
 }
 
 /* ========== 自动求导 / 张量算子 ========== */
@@ -2014,7 +3291,7 @@ static int assign_tensor(Node *tgt, Value *val, Env *env) {
         Value *idx = eval_node(tgt->binary.right, env);
         Value *base = env_get(env, inner->ident.name);
         if (base && base->type == VAL_TENSOR && base->tval->ndim == 1) {
-            int i = (int)idx->ival;
+            int i = (int)idx_val(idx);
             if (i < 0 || i >= base->tval->size) runtime_error(tgt, "张量索引越界");
             double v = (val->type == VAL_FLOAT) ? val->fval : (val->type == VAL_INT ? val->ival : 0);
             base->tval->data[i] = (float)v;
@@ -2156,12 +3433,23 @@ static Value *builtin_reshape(int argc, Value **argv) {
     memcpy(c->data, t->data, t->size * sizeof(float));
     Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
 }
+/* 求和：张量 -> 标量张量；列表 -> 数值（多态，与 累加 等价） */
 static Value *builtin_sum(int argc, Value **argv) {
-    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "求和需要1个张量");
+    if (argc != 1) runtime_error(NULL, "求和需要1个参数（张量或列表）");
+    if (argv[0]->type == VAL_LIST) return builtin_total(argc, argv);
+    if (argv[0]->type != VAL_TENSOR) runtime_error(NULL, "求和需要1个张量或列表");
     Value *r = val_new(VAL_TENSOR); r->tval = t_sum(argv[0]->tval); return r;
 }
+/* 均值：张量 -> 标量张量；列表 -> 浮点平均值（多态） */
 static Value *builtin_mean(int argc, Value **argv) {
-    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "均值需要1个张量");
+    if (argc != 1) runtime_error(NULL, "均值需要1个参数（张量或列表）");
+    if (argv[0]->type == VAL_LIST) {
+        if (argv[0]->list_len == 0) runtime_error(NULL, "均值不能作用于空列表");
+        double s = 0;
+        for (int i = 0; i < argv[0]->list_len; i++) s += num_of(argv[0]->lval[i], "均值");
+        return val_flt(s / argv[0]->list_len);
+    }
+    if (argv[0]->type != VAL_TENSOR) runtime_error(NULL, "均值需要1个张量或列表");
     Value *r = val_new(VAL_TENSOR); r->tval = t_mean(argv[0]->tval); return r;
 }
 static Value *builtin_exp(int argc, Value **argv) {
@@ -2250,10 +3538,46 @@ static Value *builtin_requires_grad(int argc, Value **argv) {
     Value *r = val_new(VAL_TENSOR); r->tval = tensor_retain(argv[0]->tval); return r;
 }
 
+/* 断言：条件为假立即报错退出，是自动化测试的基石 */
+static Value *builtin_assert(int argc, Value **argv) {
+    if (argc < 1) runtime_error(NULL, "断言函数需要至少1个参数");
+    int ok = truthy(argv[0]);
+    if (!ok) {
+        const char *msg = (argc >= 2 && argv[1]->type == VAL_STRING) ? argv[1]->sval : "（无说明）";
+        fprintf(stderr, "断言失败: %s\n", msg);
+        exit(1);
+    }
+    return val_new(VAL_NULL);
+}
+
+/* 相等断言：不相等时打印期望值与实际值，便于定位 */
+static Value *builtin_assert_eq(int argc, Value **argv) {
+    if (argc < 2) runtime_error(NULL, "断言相等函数需要至少2个参数");
+    char *a = val_to_string(argv[0]);
+    char *b = val_to_string(argv[1]);
+    int eq;
+    if (is_numeric_val(argv[0]) && is_numeric_val(argv[1])) {
+        eq = fabs(numeric_of(argv[0]) - numeric_of(argv[1])) < 1e-9;  /* 数值按容差比较，避免浮点抖动 */
+    } else {
+        eq = val_equals(argv[0], argv[1]);   /* 结构化比较：列表/字典/张量都能正确判等 */
+    }
+    if (!eq) {
+        const char *msg = (argc >= 3 && argv[2]->type == VAL_STRING) ? argv[2]->sval : "（无说明）";
+        fprintf(stderr, "断言失败: %s\n  期望: %s\n  实际: %s\n", msg, b, a);
+        free(a); free(b);
+        exit(1);
+    }
+    free(a); free(b);
+    return val_new(VAL_NULL);
+}
+
 /* 调用内置函数 */
 static Value *call_builtin(const char *name, int argc, Value **argv) {
+    if (strcmp(name, "断言") == 0) return builtin_assert(argc, argv);
+    if (strcmp(name, "断言相等") == 0) return builtin_assert_eq(argc, argv);
     if (strcmp(name, "长度") == 0) return builtin_len(argc, argv);
     if (strcmp(name, "类型") == 0) return builtin_type(argc, argv);
+    if (strcmp(name, "转布尔") == 0) return builtin_to_bool(argc, argv);
     if (strcmp(name, "转整数") == 0) return builtin_int(argc, argv);
     if (strcmp(name, "转浮点") == 0) return builtin_float(argc, argv);
     if (strcmp(name, "转字符串") == 0) return builtin_str(argc, argv);
@@ -2262,20 +3586,70 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "绝对值") == 0) return builtin_abs(argc, argv);
     if (strcmp(name, "平方根") == 0) return builtin_sqrt(argc, argv);
     if (strcmp(name, "随机数") == 0) return builtin_random(argc, argv);
+    if (strcmp(name, "时钟") == 0) return builtin_now(argc, argv);
     if (strcmp(name, "取整") == 0) return builtin_round(argc, argv);
+    if (strcmp(name, "向下取整") == 0) return builtin_floor(argc, argv);
+    if (strcmp(name, "向上取整") == 0) return builtin_ceil(argc, argv);
+    if (strcmp(name, "截断") == 0) return builtin_trunc(argc, argv);
     if (strcmp(name, "最大值") == 0) return builtin_max(argc, argv);
     if (strcmp(name, "最小值") == 0) return builtin_min(argc, argv);
+    if (strcmp(name, "幂") == 0) return builtin_pow(argc, argv);
+    if (strcmp(name, "正弦") == 0) return builtin_sin(argc, argv);
+    if (strcmp(name, "余弦") == 0) return builtin_cos(argc, argv);
+    if (strcmp(name, "正切") == 0) return builtin_tan(argc, argv);
+    if (strcmp(name, "自然对数") == 0) return builtin_ln(argc, argv);
+    if (strcmp(name, "圆周率") == 0) return builtin_pi(argc, argv);
+    if (strcmp(name, "符号") == 0) return builtin_sign(argc, argv);
+    if (strcmp(name, "随机整数") == 0) return builtin_rand_int(argc, argv);
     /* 列表函数 */
     if (strcmp(name, "追加") == 0) return builtin_append(argc, argv);
     if (strcmp(name, "删除") == 0) return builtin_remove(argc, argv);
     if (strcmp(name, "排序") == 0) return builtin_sort(argc, argv);
     if (strcmp(name, "包含") == 0) return builtin_contains(argc, argv);
+    if (strcmp(name, "范围") == 0) return builtin_range(argc, argv);
+    if (strcmp(name, "反转") == 0) return builtin_reverse(argc, argv);
+    if (strcmp(name, "索引") == 0) return builtin_index_of(argc, argv);
+    if (strcmp(name, "插入") == 0) return builtin_insert(argc, argv);
+    if (strcmp(name, "弹出") == 0) return builtin_pop(argc, argv);
+    if (strcmp(name, "唯一") == 0) return builtin_unique(argc, argv);
+    if (strcmp(name, "计数") == 0) return builtin_count(argc, argv);
+    if (strcmp(name, "切片") == 0) return builtin_slice(argc, argv);
+    if (strcmp(name, "扁平") == 0) return builtin_flatten(argc, argv);
+    if (strcmp(name, "累加") == 0) return builtin_total(argc, argv);
+    /* 字典函数 */
+    if (strcmp(name, "键") == 0) return builtin_keys(argc, argv);
+    if (strcmp(name, "值") == 0) return builtin_values(argc, argv);
+    if (strcmp(name, "移除键") == 0) return builtin_del_key(argc, argv);
+    if (strcmp(name, "项") == 0) return builtin_items(argc, argv);
+    /* 高阶函数 */
+    if (strcmp(name, "映射") == 0) return builtin_map_fn(argc, argv);
+    if (strcmp(name, "过滤") == 0) return builtin_filter_fn(argc, argv);
+    if (strcmp(name, "归约") == 0) return builtin_reduce_fn(argc, argv);
+    if (strcmp(name, "全部满足") == 0) return builtin_all_fn(argc, argv);
+    if (strcmp(name, "任一满足") == 0) return builtin_any_fn(argc, argv);
     /* 字符串函数 */
     if (strcmp(name, "分割") == 0) return builtin_split(argc, argv);
     if (strcmp(name, "连接") == 0) return builtin_join(argc, argv);
     if (strcmp(name, "替换") == 0) return builtin_replace(argc, argv);
     if (strcmp(name, "查找") == 0) return builtin_find(argc, argv);
     if (strcmp(name, "截取") == 0) return builtin_substring(argc, argv);
+    if (strcmp(name, "去空白") == 0) return builtin_trim(argc, argv);
+    if (strcmp(name, "去左空白") == 0) return builtin_ltrim(argc, argv);
+    if (strcmp(name, "去右空白") == 0) return builtin_rtrim(argc, argv);
+    if (strcmp(name, "大写") == 0) return builtin_upper(argc, argv);
+    if (strcmp(name, "小写") == 0) return builtin_lower(argc, argv);
+    if (strcmp(name, "重复") == 0) return builtin_repeat(argc, argv);
+    if (strcmp(name, "开头是") == 0) return builtin_startswith(argc, argv);
+    if (strcmp(name, "结尾是") == 0) return builtin_endswith(argc, argv);
+    if (strcmp(name, "字符码") == 0) return builtin_char_code(argc, argv);
+    if (strcmp(name, "码转字符") == 0) return builtin_from_code(argc, argv);
+    /* 文件读写 */
+    if (strcmp(name, "读文件") == 0) return builtin_read_file(argc, argv);
+    if (strcmp(name, "写文件") == 0) return builtin_write_file(argc, argv);
+    if (strcmp(name, "追加文件") == 0) return builtin_append_file(argc, argv);
+    if (strcmp(name, "文件存在") == 0) return builtin_file_exists(argc, argv);
+    if (strcmp(name, "删除文件") == 0) return builtin_delete_file(argc, argv);
+    if (strcmp(name, "读取行") == 0) return builtin_read_lines(argc, argv);
     /* 张量 / 模型开发 */
     if (strcmp(name, "张量") == 0) return builtin_tensor(argc, argv);
     if (strcmp(name, "全零") == 0) return builtin_zeros(argc, argv);
@@ -2307,6 +3681,160 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     return NULL;
 }
 
+/* ========== 类型系统（渐进式静态类型检查） ========== */
+static const char *val_type_name(Value *v) {
+    switch (v->type) {
+        case VAL_NULL:   return "空";
+        case VAL_BOOL:   return "布尔";
+        case VAL_INT:    return "整数";
+        case VAL_FLOAT:  return "浮点";
+        case VAL_STRING: return "字符串";
+        case VAL_LIST:   return "列表";
+        case VAL_MAP:    return "字典";
+        case VAL_FUNC:   return "函数";
+        case VAL_TENSOR: return "张量";
+        default:         return "未知";
+    }
+}
+
+/* 值是否符合给定类型标注（标注为 NULL 表示动态，永远通过） */
+static int type_matches(const char *annot, Value *v) {
+    if (!annot) return 1;
+    if (strcmp(annot, "整数") == 0)   return v->type == VAL_INT;
+    /* 数值加宽：整数可赋给 浮点（无精度损失），反向不允许。
+       这与 C/Java/Go 的隐式提升一致，避免写 安全比值(1, 2) 这类调用被无谓拒绝。 */
+    if (strcmp(annot, "浮点") == 0)   return v->type == VAL_FLOAT || v->type == VAL_INT;
+    if (strcmp(annot, "数字") == 0)   return v->type == VAL_FLOAT || v->type == VAL_INT;
+    if (strcmp(annot, "字符串") == 0) return v->type == VAL_STRING;
+    if (strcmp(annot, "布尔") == 0)   return v->type == VAL_BOOL;
+    if (strcmp(annot, "列表") == 0)   return v->type == VAL_LIST;
+    if (strcmp(annot, "字典") == 0)   return v->type == VAL_MAP;
+    if (strcmp(annot, "张量") == 0)   return v->type == VAL_TENSOR;
+    if (strcmp(annot, "函数") == 0)   return v->type == VAL_FUNC;
+    if (strcmp(annot, "任意") == 0)   return 1;
+    if (strcmp(annot, "空") == 0)     return v->type == VAL_NULL;
+    return 1; /* 未知标注，放行 */
+}
+
+static void ensure_type(const char *annot, Value *v, Node *n, const char *where) {
+    if (!annot) return;
+    if (!type_matches(annot, v)) {
+        runtime_error(n, "类型错误（%s）：期望 %s，得到 %s", where, annot, val_type_name(v));
+    }
+}
+
+/* 当前函数返回类型（用于返回语句检查；线程局部） */
+static __thread const char *g_cur_ret_type = NULL;
+
+/* ========== 并发原语（并发 spawn / 等待 join） ========== */
+static void *task_worker(void *p) {
+    Task *t = (Task*)p;
+    /* 控制流标志是线程局部的，此处天然从干净状态开始 */
+    t->result = eval_node(t->node, t->env);
+    /* 释放任务隔离环境（返回值已独立持有引用，不依赖环境） */
+    for (int i = 0; i < t->env->count; i++) {
+        free(t->env->names[i]);
+        if (t->env->types[i]) free(t->env->types[i]);
+        val_free(t->env->values[i]);
+    }
+    free(t->env);
+    t->env = NULL;
+    return NULL;
+}
+
+/* 函数提升（hoisting）：在执行一段语句序列之前，先把其中所有顶层
+   `函数 ...` 定义登记进环境，这样调用顺序就与书写顺序无关
+   —— 互相递归、"主流程写在最前面" 等写法都能自然成立。 */
+static void hoist_functions(Node *prog, Env *env) {
+    if (!prog || prog->type != ND_PROGRAM) return;
+    for (int i = 0; i < prog->prog.cnt; i++) {
+        Node *s = prog->prog.stmts[i];
+        if (!s || s->type != ND_FUNC_DEF) continue;
+        Func *fn = malloc(sizeof(Func));
+        if (!fn) { fprintf(stderr, "内存不足: 函数提升\n"); exit(1); }
+        fn->name        = strdup(s->func_def.name);
+        fn->params      = s->func_def.pnames;
+        fn->param_count = s->func_def.pcnt;
+        fn->ptypes      = s->func_def.ptypes;
+        fn->ret_type    = s->func_def.ret_type;
+        fn->body        = s->func_def.body;
+        Value *fnv = val_new(VAL_FUNC);
+        fnv->fnval = fn;
+        env_set(env, fn->name, fnv);
+        val_free(fnv);
+    }
+}
+
+/* 释放一个调用/任务环境（其中的名字、类型标注、值均由该环境持有） */
+static void env_release(Env *e) {
+    if (!e) return;
+    for (int i = 0; i < e->count; i++) {
+        free(e->names[i]);
+        if (e->types[i]) free(e->types[i]);
+        val_free(e->values[i]);
+    }
+    free(e);
+}
+
+/* 递归深度上限：把「无限递归 -> 段错误」变成一条清晰的运行时错误 */
+#define CO_MAX_CALL_DEPTH 3000
+static __thread int g_call_depth = 0;
+
+/* 统一的用户函数调用入口
+   —— 原先有两条重复实现，其中表达式调用那条不支持 g_return_flag，
+      导致 `如果 ... 返回` 在函数值调用时失效；此处合并为一条并补齐：
+      1) 参数个数/类型检查   2) 返回值语义统一
+      3) 循环上下文隔离（函数体内的 跳出/继续 不再污染调用处的循环）
+      4) 递归深度保护 */
+static Value *invoke_func(Func *fn, Value **args, int argc, Node *site, Env *env) {
+    if (fn->param_count != argc)
+        runtime_error(site, "函数 %s 参数数量错误: 期望 %d, 得到 %d",
+                      fn->name ? fn->name : "匿名", fn->param_count, argc);
+    if (++g_call_depth > CO_MAX_CALL_DEPTH) {
+        g_call_depth--;
+        runtime_error(site, "递归过深（超过 %d 层），请检查是否存在无限递归", CO_MAX_CALL_DEPTH);
+    }
+    for (int i = 0; i < argc; i++)
+        if (fn->ptypes && fn->ptypes[i]) ensure_type(fn->ptypes[i], args[i], site, "函数参数");
+
+    Env *call_env = env_new(env);
+    for (int i = 0; i < argc; i++) {
+        env_set(call_env, fn->params[i], args[i]);   /* env_set 内部 retain，实参仍由调用方释放 */
+        if (fn->ptypes && fn->ptypes[i]) env_set_type(call_env, fn->params[i], fn->ptypes[i]);
+    }
+
+    LoopContext *saved_loop  = loop_ctx;
+    const char  *saved_rtype = g_cur_ret_type;
+    int          saved_flag  = g_return_flag;
+    Value       *saved_rval  = g_return_value;
+    loop_ctx       = NULL;          /* 函数体不属于调用处的循环 */
+    g_cur_ret_type = fn->ret_type;
+    g_return_flag  = 0;
+    g_return_value = NULL;
+
+    Node *body = (Node*)fn->body;
+    for (int i = 0; i < body->prog.cnt; i++) {
+        if (g_return_flag) break;
+        exec_node(body->prog.stmts[i], call_env);
+    }
+    Value *ret = g_return_flag ? g_return_value : NULL;
+
+    g_return_flag  = saved_flag;
+    g_return_value = saved_rval;
+    g_cur_ret_type = saved_rtype;
+    loop_ctx       = saved_loop;
+    g_call_depth--;
+
+    env_release(call_env);
+    return ret ? ret : val_new(VAL_NULL);
+}
+
+/* 供高阶内置函数（映射/过滤/归约…）回调用户函数 */
+static Value *call_fn_value(Value *fnval, Value **args, int argc) {
+    if (!fnval || fnval->type != VAL_FUNC) runtime_error(NULL, "传入的不是函数");
+    return invoke_func(fnval->fnval, args, argc, NULL, g_root_env);
+}
+
 static Value *eval_node(Node *n, Env *env) {
     if (!n) return val_new(VAL_NULL);
     switch (n->type) {
@@ -2314,6 +3842,7 @@ static Value *eval_node(Node *n, Env *env) {
             Value *v = val_new(n->literal.lit_type);
             switch (n->literal.lit_type) {
                 case VAL_INT: v->ival = atol(n->literal.value); break;
+                case VAL_BOOL: v->ival = (n->literal.value[0] == '1'); break;
                 case VAL_FLOAT: v->fval = atof(n->literal.value); break;
                 case VAL_STRING: v->sval = strdup(n->literal.value); break;
                 default: break;
@@ -2331,18 +3860,24 @@ static Value *eval_node(Node *n, Env *env) {
             if (strcmp(n->binary.op, "[]") == 0) {
                 Value *idx = eval_node(n->binary.right, env);
                 if (l->type == VAL_LIST) {
-                    int i = (int)idx->ival;
-                    if (i < 0 || i >= l->list_len) runtime_error(n, "列表索引越界: %d (列表长度 %d)", i, l->list_len);
+                    int i0 = (int)idx_val(idx), i = i0;
+                    if (i < 0) i += l->list_len;      /* 负索引：-1 表示最后一个元素 */
+                    if (i < 0 || i >= l->list_len) runtime_error(n, "列表索引越界: %d (列表长度 %d)", i0, l->list_len);
+                    /* 先 retain 元素再释放容器：顺序颠倒会把元素一起释放掉 */
+                    Value *elem = val_retain(l->lval[i]);
                     val_free(idx);
-                    return val_retain(l->lval[i]);
+                    val_free(l);
+                    return elem;
                 } else if (l->type == VAL_STRING) {
-                    int i = (int)idx->ival;
-                    int slen = strlen(l->sval);
-                    if (i < 0 || i >= slen) runtime_error(n, "字符串索引越界: %d", i);
-                    char tmp[2] = { l->sval[i], 0 };
+                    int i = (int)idx_val(idx);
+                    /* 按【字符】取值：支持负索引，取出完整 UTF-8 序列（不会切碎汉字） */
+                    long slen = utf8_strlen(l->sval);
+                    long ci = i < 0 ? i + slen : i;
+                    char *ch = (ci >= 0 && ci < slen) ? utf8_char_at(l->sval, ci) : NULL;
+                    if (!ch) runtime_error(n, "字符串索引越界: %d（长度 %ld）", i, slen);
                     val_free(idx);
                     Value *r = val_new(VAL_STRING);
-                    r->sval = strdup(tmp);
+                    r->sval = ch;
                     val_free(l);
                     return r;
                 } else if (l->type == VAL_MAP) {
@@ -2353,7 +3888,7 @@ static Value *eval_node(Node *n, Env *env) {
                     if (!v) return val_new(VAL_NULL);
                     return val_retain(v);
                 } else if (l->type == VAL_TENSOR) {
-                    int i = (int)idx->ival;
+                    int i = (int)idx_val(idx);
                     Tensor *T = l->tval;
                     if (T->ndim == 1) {
                         if (i < 0 || i >= T->size) runtime_error(n, "张量索引越界");
@@ -2374,68 +3909,69 @@ static Value *eval_node(Node *n, Env *env) {
                 runtime_error(n, "不支持的类型索引");
             }
             
-            /* 逻辑运算符 */
+            /* 逻辑运算符（短路求值，结果是布尔） */
             if (strcmp(n->binary.op, "且") == 0) {
-                int li = (l->type == VAL_INT) ? (int)l->ival : (l->type == VAL_FLOAT ? l->fval != 0 : 0);
-                if (!li) {
-                    val_free(l);
-                    Value *r = val_new(VAL_INT);
-                    r->ival = 0;
-                    return r;
-                }
+                if (!truthy(l)) { val_free(l); return val_bool(0); }
                 Value *r = eval_node(n->binary.right, env);
-                int ri = (r->type == VAL_INT) ? (int)r->ival : (r->type == VAL_FLOAT ? r->fval != 0 : 0);
+                int ri = truthy(r);
                 val_free(l); val_free(r);
-                Value *result = val_new(VAL_INT);
-                result->ival = ri ? 1 : 0;
-                return result;
+                return val_bool(ri);
             }
             if (strcmp(n->binary.op, "或") == 0) {
-                int li = (l->type == VAL_INT) ? (int)l->ival : (l->type == VAL_FLOAT ? l->fval != 0 : 0);
-                if (li) {
-                    val_free(l);
-                    Value *r = val_new(VAL_INT);
-                    r->ival = 1;
-                    return r;
-                }
+                if (truthy(l)) { val_free(l); return val_bool(1); }
                 Value *r = eval_node(n->binary.right, env);
-                int ri = (r->type == VAL_INT) ? (int)r->ival : (r->type == VAL_FLOAT ? r->fval != 0 : 0);
+                int ri = truthy(r);
                 val_free(l); val_free(r);
-                Value *result = val_new(VAL_INT);
-                result->ival = ri ? 1 : 0;
-                return result;
+                return val_bool(ri);
             }
             
             Value *r = eval_node(n->binary.right, env);
-            /* 字符串拼接 */
-            if (l->type == VAL_STRING || r->type == VAL_STRING) {
-                char buf[4096];
-                buf[0] = '\0';
-                if (l->type == VAL_STRING) {
-                    strncpy(buf, l->sval, sizeof(buf) - 1);
-                    buf[sizeof(buf) - 1] = '\0';
-                } else if (l->type == VAL_INT) {
-                    snprintf(buf, sizeof(buf), "%ld", l->ival);
-                } else if (l->type == VAL_FLOAT) {
-                    snprintf(buf, sizeof(buf), "%g", l->fval);
+
+            /* 比较运算符：必须在字符串拼接/数值分支之前处理。
+               否则 "abc" == "xyz" 会被当成字符串拼接（结果非空 → 恒为真），
+               列表/字典比较则会误读联合体。此处统一交给 val_equals / val_cmp，
+               对任意类型都给出正确语义，结果一律为布尔。 */
+            {
+                const char *bop = n->binary.op;
+                int is_eq  = (strcmp(bop, "==") == 0), is_ne = (strcmp(bop, "!=") == 0);
+                int is_lt  = (strcmp(bop, "<")  == 0), is_gt = (strcmp(bop, ">")  == 0);
+                int is_le  = (strcmp(bop, "<=") == 0), is_ge = (strcmp(bop, ">=") == 0);
+                if (is_eq || is_ne) {
+                    int eq = val_equals(l, r);
+                    val_free(l); val_free(r);
+                    return val_bool(is_eq ? eq : !eq);
                 }
-                size_t buf_len = strlen(buf);
-                if (r->type == VAL_STRING) {
-                    if (buf_len + strlen(r->sval) < sizeof(buf)) {
-                        strcat(buf, r->sval);
+                if (is_lt || is_gt || is_le || is_ge) {
+                    /* 大小比较要求同类可比：数值之间、字符串之间、列表之间 */
+                    int ok = (is_numeric_val(l) && is_numeric_val(r)) ||
+                             (l->type == VAL_STRING && r->type == VAL_STRING) ||
+                             (l->type == VAL_LIST   && r->type == VAL_LIST);
+                    if (!ok) {
+                        const char *ln = val_type_name(l), *rn = val_type_name(r);
+                        val_free(l); val_free(r);
+                        runtime_error(n, "无法比较大小: %s %s %s", ln, bop, rn);
                     }
-                } else if (r->type == VAL_INT) {
-                    char tmp[64];
-                    snprintf(tmp, sizeof(tmp), "%ld", r->ival);
-                    if (buf_len + strlen(tmp) < sizeof(buf)) strcat(buf, tmp);
-                } else if (r->type == VAL_FLOAT) {
-                    char tmp[64];
-                    snprintf(tmp, sizeof(tmp), "%g", r->fval);
-                    if (buf_len + strlen(tmp) < sizeof(buf)) strcat(buf, tmp);
+                    int c = val_cmp(l, r);
+                    val_free(l); val_free(r);
+                    return val_bool(is_lt ? c < 0 : is_gt ? c > 0 : is_le ? c <= 0 : c >= 0);
                 }
+            }
+            /* 字符串拼接：只有 + 才拼接。
+               以前任何运算符碰到字符串都会拼接，导致 "a" - 1 静默产出 "a1" 这种荒谬结果。 */
+            if (l->type == VAL_STRING || r->type == VAL_STRING) {
+                if (strcmp(n->binary.op, "+") != 0) {
+                    const char *ln = val_type_name(l), *rn = val_type_name(r);
+                    char opbuf[8]; snprintf(opbuf, sizeof(opbuf), "%s", n->binary.op);
+                    val_free(l); val_free(r);
+                    runtime_error(n, "字符串只支持 + 拼接，不支持 %s（%s %s %s）", opbuf, ln, opbuf, rn);
+                }
+                /* 任意类型都能与字符串拼接（走统一的值→文本转换，布尔显示为 真/假） */
+                SBuf sb; sb_init(&sb);
+                val_to_sbuf(l, &sb);
+                val_to_sbuf(r, &sb);
                 val_free(l); val_free(r);
                 Value *sv = val_new(VAL_STRING);
-                sv->sval = strdup(buf);
+                sv->sval = sb.buf;
                 return sv;
             }
             /* 张量运算（支持广播与自动求导） */
@@ -2447,23 +3983,47 @@ static Value *eval_node(Node *n, Env *env) {
             if (l->type == VAL_TENSOR || r->type == VAL_TENSOR) {
                 runtime_error(n, "张量运算需要两个张量");
             }
-            /* 普通数值 */
-            double ld = (l->type == VAL_FLOAT) ? l->fval : l->ival;
-            double rd = (r->type == VAL_FLOAT) ? r->fval : r->ival;
+            /* 普通数值算术（比较运算符已在上面处理完毕，此处只剩 + - * / // %） */
+            const char *op = n->binary.op;
+            if (!is_numeric_val(l) || !is_numeric_val(r)) {
+                /* 列表 + 列表 = 拼接；其余非数值组合直接报错，绝不静默误算 */
+                if (strcmp(op, "+") == 0 && l->type == VAL_LIST && r->type == VAL_LIST) {
+                    Value *cat = list_new_empty();
+                    /* list_push 内部已 retain，此处不可再 retain（会造成引用计数永不归零） */
+                    for (int i = 0; i < l->list_len; i++) list_push(cat, l->lval[i]);
+                    for (int i = 0; i < r->list_len; i++) list_push(cat, r->lval[i]);
+                    val_free(l); val_free(r);
+                    return cat;
+                }
+                const char *ln = val_type_name(l), *rn = val_type_name(r);
+                char opbuf[8]; snprintf(opbuf, sizeof(opbuf), "%s", op);
+                val_free(l); val_free(r);
+                runtime_error(n, "不支持的运算: %s %s %s", ln, opbuf, rn);
+            }
+            double ld = numeric_of(l);
+            double rd = numeric_of(r);
             double result = 0;
-            if (strcmp(n->binary.op, "+") == 0) result = ld + rd;
-            else if (strcmp(n->binary.op, "-") == 0) result = ld - rd;
-            else if (strcmp(n->binary.op, "*") == 0) result = ld * rd;
-            else if (strcmp(n->binary.op, "/") == 0) result = rd != 0 ? ld / rd : 0;
-            else if (strcmp(n->binary.op, "%") == 0) result = (long)ld % (long)rd;
-            else if (strcmp(n->binary.op, "<") == 0) result = ld < rd;
-            else if (strcmp(n->binary.op, ">") == 0) result = ld > rd;
-            else if (strcmp(n->binary.op, "<=") == 0) result = ld <= rd;
-            else if (strcmp(n->binary.op, ">=") == 0) result = ld >= rd;
-            else if (strcmp(n->binary.op, "==") == 0) result = ld == rd;
-            else if (strcmp(n->binary.op, "!=") == 0) result = ld != rd;
-            else runtime_error(n, "无效的二元运算符: %s", n->binary.op);
-            int is_float = (l->type == VAL_FLOAT || r->type == VAL_FLOAT);
+            /* force：1=强制浮点（真除法），0=随操作数 */
+            int force = 0;
+            if (strcmp(op, "+") == 0) result = ld + rd;
+            else if (strcmp(op, "-") == 0) result = ld - rd;
+            else if (strcmp(op, "*") == 0) result = ld * rd;
+            else if (strcmp(op, "/") == 0) {
+                /* 真除法：3 / 2 得 1.5 而非 1；除零必须报错而不是静默返回 0 */
+                if (rd == 0) { val_free(l); val_free(r); runtime_error(n, "除以零"); }
+                result = ld / rd; force = 1;
+            }
+            else if (strcmp(op, "//") == 0) {
+                if (rd == 0) { val_free(l); val_free(r); runtime_error(n, "整除的除数为零"); }
+                result = floor(ld / rd);        /* 向下取整，与取模符号一致 */
+            }
+            else if (strcmp(op, "%") == 0) {
+                if (rd == 0) { val_free(l); val_free(r); runtime_error(n, "取模的除数为零"); }
+                result = fmod(ld, rd);          /* 支持浮点取模 */
+            }
+            else { val_free(l); val_free(r); runtime_error(n, "无效的二元运算符: %s", op); }
+            int is_float = (force == 1) ? 1 :
+                           (l->type == VAL_FLOAT || r->type == VAL_FLOAT);
             val_free(l); val_free(r);
             if (is_float) {
                 Value *fv = val_new(VAL_FLOAT);
@@ -2478,22 +4038,97 @@ static Value *eval_node(Node *n, Env *env) {
         case ND_UNARY: {
             Value *v = eval_node(n->unary.operand, env);
             if (strcmp(n->unary.op, "-") == 0) {
-                if (v->type == VAL_INT) {
-                    v->ival = -v->ival;
-                } else if (v->type == VAL_FLOAT) {
-                    v->fval = -v->fval;
+                /* 必须返回【新值】：操作数可能是变量或容器元素的共享引用
+                   （eval 返回的是 retain 后的同一对象），原地取负会篡改源数据。 */
+                if (v->type == VAL_INT)   { long x = v->ival; val_free(v); return val_int(-x); }
+                if (v->type == VAL_FLOAT) { double x = v->fval; val_free(v); return val_flt(-x); }
+                if (v->type == VAL_BOOL)  { long x = v->ival; val_free(v); return val_int(-x); }
+                if (v->type == VAL_TENSOR) {
+                    Tensor *t = v->tval;
+                    Tensor *o = tensor_new(t->ndim, t->shape);
+                    for (int i = 0; i < t->size; i++) o->data[i] = -t->data[i];
+                    val_free(v);
+                    Value *r = val_new(VAL_TENSOR); r->tval = o; return r;
                 }
-                return v;
-            } else if (strcmp(n->unary.op, "not") == 0) {
-                int b = (v->type == VAL_INT) ? (int)v->ival : (v->type == VAL_FLOAT ? v->fval != 0 : 0);
+                const char *tn = val_type_name(v);
                 val_free(v);
-                Value *r = val_new(VAL_INT);
-                r->ival = b ? 0 : 1;
-                return r;
+                runtime_error(n, "取负需要数字或张量，得到 %s", tn);
+            } else if (strcmp(n->unary.op, "+") == 0) {
+                if (is_numeric_val(v) || v->type == VAL_TENSOR) return v;
+                const char *tn = val_type_name(v);
+                val_free(v);
+                runtime_error(n, "取正需要数字或张量，得到 %s", tn);
+            } else if (strcmp(n->unary.op, "not") == 0) {
+                int b = truthy(v);
+                val_free(v);
+                return val_bool(!b);
             }
             return v;
         }
         case ND_LIST_LIT: {
+            if (n->list_lit.is_comprehension) {
+                /* 列表推导式：[body 对于 x 于 src 若 filter] */
+                const char *iname = n->list_lit.elements[1]->ident.name;
+                Node *filter = n->list_lit.elements[3];
+                Value *src = eval_node(n->list_lit.elements[2], env);
+                Value *result = val_new(VAL_LIST);
+                result->list_len = 0; result->lval = NULL;
+                int take;
+                if (src->type == VAL_LIST) {
+                    for (int i = 0; i < src->list_len; i++) {
+                        env_set(env, iname, src->lval[i]);   /* env_set 内部已 retain */
+                        take = 1;
+                        if (filter) {
+                            Value *fv = eval_node(filter, env);
+                            take = truthy(fv);
+                            val_free(fv);
+                        }
+                        if (take) {
+                            Value *item = eval_node(n->list_lit.elements[0], env);
+                            result->lval = realloc(result->lval, (result->list_len+1)*sizeof(Value*));
+                            result->lval[result->list_len++] = item;
+                        }
+                    }
+                } else if (src->type == VAL_STRING) {
+                    /* 按字符遍历，中文字符串推导式不会产生乱码 */
+                    long slen = utf8_strlen(src->sval);
+                    for (long i = 0; i < slen; i++) {
+                        Value *ch = val_new(VAL_STRING); ch->sval = utf8_char_at(src->sval, i);
+                        env_set(env, iname, ch); val_free(ch);
+                        take = 1;
+                        if (filter) {
+                            Value *fv = eval_node(filter, env);
+                            take = truthy(fv);
+                            val_free(fv);
+                        }
+                        if (take) {
+                            Value *item = eval_node(n->list_lit.elements[0], env);
+                            result->lval = realloc(result->lval, (result->list_len+1)*sizeof(Value*));
+                            result->lval[result->list_len++] = item;
+                        }
+                    }
+                } else if (src->type == VAL_MAP) {
+                    for (int i = 0; i < MAX_DICT_SIZE; i++) {
+                        if (!src->mval->entries[i].used) continue;
+                        env_set(env, iname, src->mval->entries[i].val);   /* env_set 内部已 retain */
+                        take = 1;
+                        if (filter) {
+                            Value *fv = eval_node(filter, env);
+                            take = truthy(fv);
+                            val_free(fv);
+                        }
+                        if (take) {
+                            Value *item = eval_node(n->list_lit.elements[0], env);
+                            result->lval = realloc(result->lval, (result->list_len+1)*sizeof(Value*));
+                            result->lval[result->list_len++] = item;
+                        }
+                    }
+                } else {
+                    runtime_error(n, "推导式数据源必须是列表/字符串/字典");
+                }
+                val_free(src);
+                return result;
+            }
             Value *list = val_new(VAL_LIST);
             list->list_len = n->list_lit.ecnt;
             list->lval = malloc(list->list_len * sizeof(Value*));
@@ -2503,6 +4138,66 @@ static Value *eval_node(Node *n, Env *env) {
             return list;
         }
         case ND_MAP_LIT: {
+            if (n->map_lit.is_comprehension) {
+                /* 字典推导式：{k:v 对于 kk[, vv] 在 src 若 filter}
+                   单变量时：列表源绑定元素、字典源绑定键 */
+                const char *ik = n->map_lit.keys[1]->ident.name;
+                const char *iv = n->map_lit.vals[1] ? n->map_lit.vals[1]->ident.name : NULL;
+                Node *filter = n->map_lit.keys[3];
+                Value *src = eval_node(n->map_lit.keys[2], env);
+                Value *result = val_new(VAL_MAP);
+                int take;
+                if (src->type == VAL_MAP) {
+                    for (int i = 0; i < MAX_DICT_SIZE; i++) {
+                        if (!src->mval->entries[i].used) continue;
+                        Value *kv = val_new(VAL_STRING); kv->sval = strdup(src->mval->entries[i].key);
+                        env_set(env, ik, kv); val_free(kv);
+                        if (iv) env_set(env, iv, src->mval->entries[i].val);   /* env_set 内部已 retain */
+                        take = 1;
+                        if (filter) {
+                            Value *fv = eval_node(filter, env);
+                            take = truthy(fv);
+                            val_free(fv);
+                        }
+                        if (take) {
+                            Value *k = eval_node(n->map_lit.keys[0], env);
+                            Value *v = eval_node(n->map_lit.vals[0], env);
+                            if (k->type == VAL_STRING) dict_set(result->mval, k->sval, v);
+                            else { char buf[64]; if(k->type==VAL_INT) snprintf(buf,sizeof(buf),"%ld",k->ival); else snprintf(buf,sizeof(buf),"%g",k->fval); dict_set(result->mval, buf, v); }
+                            val_free(k); val_free(v);
+                        }
+                    }
+                } else if (src->type == VAL_LIST) {
+                    for (int i = 0; i < src->list_len; i++) {
+                        if (iv) {
+                            /* 双变量：第一个是下标，第二个是元素 */
+                            Value *idv = val_new(VAL_INT); idv->ival = i;
+                            env_set(env, ik, idv); val_free(idv);
+                            env_set(env, iv, src->lval[i]);   /* env_set 内部已 retain */
+                        } else {
+                            /* 单变量：直接绑定元素本身 */
+                            env_set(env, ik, src->lval[i]);
+                        }
+                        take = 1;
+                        if (filter) {
+                            Value *fv = eval_node(filter, env);
+                            take = truthy(fv);
+                            val_free(fv);
+                        }
+                        if (take) {
+                            Value *k = eval_node(n->map_lit.keys[0], env);
+                            Value *v = eval_node(n->map_lit.vals[0], env);
+                            if (k->type == VAL_STRING) dict_set(result->mval, k->sval, v);
+                            else { char buf[64]; if(k->type==VAL_INT) snprintf(buf,sizeof(buf),"%ld",k->ival); else snprintf(buf,sizeof(buf),"%g",k->fval); dict_set(result->mval, buf, v); }
+                            val_free(k); val_free(v);
+                        }
+                    }
+                } else {
+                    runtime_error(n, "字典推导式数据源必须是列表/字典");
+                }
+                val_free(src);
+                return result;
+            }
             Value *map = val_new(VAL_MAP);
             for (int i = 0; i < n->map_lit.kcnt; i++) {
                 Value *k = eval_node(n->map_lit.keys[i], env);
@@ -2519,6 +4214,37 @@ static Value *eval_node(Node *n, Env *env) {
                 val_free(v);
             }
             return map;
+        }
+        case ND_CONCUR: {
+            /* 在隔离子环境中并发求值表达式，立即返回任务句柄 */
+            /* 外层环境链将被子线程读取（查找函数/全局变量），标记为共享以启用加锁 */
+            env_mark_shared(env);
+            Task *t = calloc(1, sizeof(Task));
+            t->node = n->concur_stmt.expr;
+            t->env  = env_new(env);
+            Value *h = val_new(VAL_TASK);
+            h->task = t;
+            if (pthread_create(&t->tid, NULL, task_worker, t) != 0) {
+                val_free(h);
+                runtime_error(n, "无法创建并发线程");
+            }
+            t->started = 1;
+            return h;
+        }
+        case ND_WAIT: {
+            /* join 任务句柄并取出结果（结果所有权转交调用方） */
+            Value *h = eval_node(n->wait_stmt.expr, env);
+            if (h->type != VAL_TASK || !h->task) runtime_error(n, "等待的对象不是并发任务句柄");
+            Task *t = h->task;
+            if (t->started && !t->joined) {
+                pthread_join(t->tid, NULL);
+                t->joined = 1;
+            }
+            Value *ret = t->result;
+            t->result = NULL;                 /* 摘出结果，避免句柄析构时重复释放 */
+            if (!ret) ret = val_new(VAL_NULL);
+            val_free(h);
+            return ret;
         }
         case ND_FUNC_CALL: {
             if (n->func_call.callee->type == ND_IDENT && 
@@ -2538,40 +4264,15 @@ static Value *eval_node(Node *n, Env *env) {
                 /* 先检查是否是用户定义的函数 */
                 Value *fnval = env_get(env, n->func_call.callee->ident.name);
                 if (fnval && fnval->type == VAL_FUNC) {
-                    Func *fn = fnval->fnval;
-                    if (fn->param_count != n->func_call.acnt) runtime_error(n, "函数 %s 参数数量错误: 期望 %d, 得到 %d",
-                        fn->name, fn->param_count, n->func_call.acnt);
+                    /* fnval 来自 env_get，不额外 retain，不能 free */
                     Value **args = malloc(n->func_call.acnt * sizeof(Value*));
-                    for (int i = 0; i < n->func_call.acnt; i++) {
+                    for (int i = 0; i < n->func_call.acnt; i++)
                         args[i] = eval_node(n->func_call.args[i], env);
-                    }
-                    Env *call_env = env_new(env);
-                    for (int i = 0; i < fn->param_count; i++) {
-                        env_set(call_env, fn->params[i], args[i]);
-                        val_free(args[i]);
-                    }
+                    Value *ret = invoke_func(fnval->fnval, args, n->func_call.acnt, n, env);
+                    for (int i = 0; i < n->func_call.acnt; i++) val_free(args[i]);
                     free(args);
-                    Node *body = (Node*)fn->body;
-                    Value *ret = NULL;
-                    g_return_flag = 0;
-                    g_return_value = NULL;
-                    for (int i = 0; i < body->prog.cnt; i++) {
-                        if (g_return_flag) break;
-                        exec_node(body->prog.stmts[i], call_env);
-                    }
-                    ret = g_return_flag ? g_return_value : NULL;
-                    g_return_flag = 0;
-                    g_return_value = NULL;
-                    /* 清理调用环境 */
-                    for (int i = 0; i < call_env->count; i++) {
-                        free(call_env->names[i]);
-                        val_free(call_env->values[i]);
-                    }
-                    free(call_env);
-                    /* 注意: fnval 来自 env_get，不额外 retain，不能 free */
-                    return ret ? ret : val_new(VAL_NULL);
+                    return ret;
                 }
-                /* fnval 来自 env_get，不额外 retain，不能 free */
                 /* 不是用户函数，尝试内置函数 */
                 Value **args = malloc(n->func_call.acnt * sizeof(Value*));
                 for (int i = 0; i < n->func_call.acnt; i++) {
@@ -2584,33 +4285,17 @@ static Value *eval_node(Node *n, Env *env) {
                 free(args);
                 return result;
             }
+            /* 被调用方是表达式（如列表/字典里取出的函数值） */
             Value *fnval = eval_node(n->func_call.callee, env);
             if (fnval->type != VAL_FUNC) runtime_error(n, "值不是一个函数");
-            Func *fn = fnval->fnval;
-            if (fn->param_count != n->func_call.acnt) runtime_error(n, "函数 %s 参数数量错误: 期望 %d, 得到 %d",
-                fn->name, fn->param_count, n->func_call.acnt);
-            Env *call_env = env_new(env);
-            for (int i = 0; i < fn->param_count; i++) {
-                Value *arg = eval_node(n->func_call.args[i], env);
-                env_set(call_env, fn->params[i], arg);
-                val_free(arg);
-            }
-            Node *body = (Node*)fn->body;
-            Value *ret = NULL;
-            for (int i = 0; i < body->prog.cnt; i++) {
-                if (body->prog.stmts[i]->type == ND_RETURN) {
-                    ret = eval_node(body->prog.stmts[i]->ret_stmt.val, call_env);
-                    break;
-                }
-                exec_node(body->prog.stmts[i], call_env);
-            }
-            for (int i = 0; i < call_env->count; i++) {
-                free(call_env->names[i]);
-                val_free(call_env->values[i]);
-            }
-            free(call_env);
+            Value **args = malloc(n->func_call.acnt * sizeof(Value*));
+            for (int i = 0; i < n->func_call.acnt; i++)
+                args[i] = eval_node(n->func_call.args[i], env);
+            Value *ret = invoke_func(fnval->fnval, args, n->func_call.acnt, n, env);
+            for (int i = 0; i < n->func_call.acnt; i++) val_free(args[i]);
+            free(args);
             val_free(fnval);
-            return ret ? ret : val_new(VAL_NULL);
+            return ret;
         }
         default:
             runtime_error(n, "无法求值的节点类型: %d", n->type);
@@ -2631,6 +4316,10 @@ static void exec_node(Node *n, Env *env) {
             if (n->var_decl.is_const && env_get(env, n->var_decl.name)) {
                 runtime_error(n, "常量不能重复声明");
             }
+            if (n->var_decl.type_annot) {
+                ensure_type(n->var_decl.type_annot, init, n, "变量声明");
+                env_set_type(env, n->var_decl.name, n->var_decl.type_annot);
+            }
             env_set(env, n->var_decl.name, init);
             val_free(init);
             break;
@@ -2640,6 +4329,8 @@ static void exec_node(Node *n, Env *env) {
             if (n->assign.tgt->type == ND_IDENT) {
                 Value *old = env_get(env, n->assign.tgt->ident.name);
                 if (old && old->type == VAL_FUNC) runtime_error(n->assign.tgt, "不能给函数名赋值");
+                const char *t = env_get_type(env, n->assign.tgt->ident.name);
+                if (t) ensure_type(t, val, n->assign.tgt, "赋值");
                 env_set(env, n->assign.tgt->ident.name, val);
             } else if (n->assign.tgt->type == ND_BINARY &&
                        strcmp(n->assign.tgt->binary.op, "[]") == 0) {
@@ -2650,7 +4341,7 @@ static void exec_node(Node *n, Env *env) {
                 Value *obj = eval_node(n->assign.tgt->binary.left, env);
                 Value *idx = eval_node(n->assign.tgt->binary.right, env);
                 if (obj->type == VAL_LIST) {
-                    int i = (int)idx->ival;
+                    int i = (int)idx_val(idx);
                     if (i < 0) runtime_error(n->assign.tgt, "索引不能为负数");
                     if (i >= obj->list_len) {
                         Value **new_list = realloc(obj->lval, (i+1) * sizeof(Value*));
@@ -2679,7 +4370,7 @@ static void exec_node(Node *n, Env *env) {
         }
         case ND_IF: {
             Value *condv = eval_node(n->if_stmt.cond, env);
-            int cond = (condv->type == VAL_INT) ? (int)condv->ival : (condv->type == VAL_FLOAT ? condv->fval != 0 : 0);
+            int cond = truthy(condv);
             val_free(condv);
             if (cond) {
                 for (int i = 0; i < n->if_stmt.tcnt; i++) exec_node(n->if_stmt.then_body[i], env);
@@ -2692,7 +4383,7 @@ static void exec_node(Node *n, Env *env) {
                         executed = 1;
                     } else {
                         Value *elcond = eval_node(br->cond, env);
-                        int elval = (elcond->type == VAL_INT) ? (int)elcond->ival : (elcond->type == VAL_FLOAT ? elcond->fval != 0 : 0);
+                        int elval = truthy(elcond);
                         val_free(elcond);
                         if (elval) {
                             for (int i = 0; i < br->bcnt; i++) exec_node(br->body[i], env);
@@ -2712,14 +4403,17 @@ static void exec_node(Node *n, Env *env) {
             loop_ctx = &ctx;
             
             while (!ctx.should_break) {
+                /* 每轮迭代开始清除 continue 标志：继续 只跳过当前这一轮 */
+                ctx.should_continue = 0;
                 Value *c = eval_node(n->while_stmt.cond, env);
-                int cond = (c->type == VAL_INT) ? (int)c->ival : (c->type == VAL_FLOAT ? c->fval != 0 : 0);
+                int cond = truthy(c);
                 val_free(c);
                 if (!cond) break;
                 for (int i = 0; i < n->while_stmt.bcnt; i++) {
                     exec_node(n->while_stmt.body[i], env);
-                    if (ctx.should_break) break;
+                    if (ctx.should_break || ctx.should_continue) break;
                 }
+                if (g_return_flag) break;
             }
             
             loop_ctx = ctx.parent;
@@ -2731,11 +4425,15 @@ static void exec_node(Node *n, Env *env) {
             double start = (start_v->type == VAL_FLOAT) ? start_v->fval : start_v->ival;
             double end = (end_v->type == VAL_FLOAT) ? end_v->fval : end_v->ival;
             double step = 1.0;
+            int step_is_float = 0;
             if (n->for_stmt.step) {
                 Value *step_v = eval_node(n->for_stmt.step, env);
                 step = (step_v->type == VAL_FLOAT) ? step_v->fval : step_v->ival;
+                step_is_float = (step_v->type == VAL_FLOAT);
                 val_free(step_v);
             }
+            /* 浮点判定基于求值后的实际值类型（起止可为任意表达式，而非仅字面量） */
+            int is_float = (start_v->type == VAL_FLOAT || end_v->type == VAL_FLOAT || step_is_float);
             val_free(start_v);
             val_free(end_v);
             
@@ -2746,10 +4444,7 @@ static void exec_node(Node *n, Env *env) {
             ctx.parent = loop_ctx;
             loop_ctx = &ctx;
             
-            int is_float = (n->for_stmt.start->literal.lit_type == VAL_FLOAT || 
-                           n->for_stmt.end->literal.lit_type == VAL_FLOAT ||
-                           n->for_stmt.step != NULL);
-            
+
             if (is_float) {
                 double i = start;
                 int direction = (step > 0) ? 1 : -1;
@@ -2759,11 +4454,12 @@ static void exec_node(Node *n, Env *env) {
                     env_set(env, n->for_stmt.var, iv);
                     val_free(iv);
                     
+                    ctx.should_continue = 0;
                     for (int j = 0; j < n->for_stmt.bcnt; j++) {
                         exec_node(n->for_stmt.body[j], env);
-                        if (ctx.should_break) break;
+                        if (ctx.should_break || ctx.should_continue) break;
                     }
-                    if (ctx.should_break) break;
+                    if (ctx.should_break || g_return_flag) break;
                     i += step;
                 }
             } else {
@@ -2777,11 +4473,12 @@ static void exec_node(Node *n, Env *env) {
                     env_set(env, n->for_stmt.var, iv);
                     val_free(iv);
                     
+                    ctx.should_continue = 0;
                     for (int j = 0; j < n->for_stmt.bcnt; j++) {
                         exec_node(n->for_stmt.body[j], env);
-                        if (ctx.should_break) break;
+                        if (ctx.should_break || ctx.should_continue) break;
                     }
-                    if (ctx.should_break) break;
+                    if (ctx.should_break || g_return_flag) break;
                     i += s;
                 }
             }
@@ -2794,6 +4491,8 @@ static void exec_node(Node *n, Env *env) {
             fn->name = strdup(n->func_def.name);
             fn->params = n->func_def.pnames;
             fn->param_count = n->func_def.pcnt;
+            fn->ptypes = n->func_def.ptypes;
+            fn->ret_type = n->func_def.ret_type;
             fn->body = n->func_def.body;
             Value *fnv = val_new(VAL_FUNC);
             fnv->fnval = fn;
@@ -2803,8 +4502,90 @@ static void exec_node(Node *n, Env *env) {
         }
         case ND_RETURN: {
             Value *rv = (n->ret_stmt.val) ? eval_node(n->ret_stmt.val, env) : val_new(VAL_NULL);
+            if (g_cur_ret_type) ensure_type(g_cur_ret_type, rv, n, "返回语句");
             g_return_flag = 1;
             g_return_value = rv;
+            break;
+        }
+        case ND_IMPORT: {
+            /* 模块导入：读取文件 -> 解析 -> 在子环境执行 -> 合并导出符号 */
+            char path[MAX_ID_LEN * 2];
+            if (strstr(n->import_stmt.path, ".co") == NULL) {
+                snprintf(path, sizeof(path), "%s.co", n->import_stmt.path);
+            } else {
+                snprintf(path, sizeof(path), "%s", n->import_stmt.path);
+            }
+            FILE *mf = fopen(path, "r");
+            if (!mf) {
+                fprintf(stderr, "导入错误: 无法打开模块 '%s'\n", path);
+                exit(1);
+            }
+            if (fseek(mf, 0, SEEK_END) != 0) { fclose(mf); runtime_error(n, "无法读取模块 '%s'", path); }
+            long msize = ftell(mf);
+            if (msize < 0) { fclose(mf); runtime_error(n, "无法获取模块大小 '%s'", path); }
+            rewind(mf);
+            char *mbuf = malloc((size_t)msize + 1);
+            if (!mbuf) { fclose(mf); runtime_error(n, "导入模块时内存不足"); }
+            size_t mgot = fread(mbuf, 1, (size_t)msize, mf);
+            fclose(mf);
+            mbuf[mgot] = '\0';
+            /* 保存词法状态 */
+            char *save_src = (char*)src; int save_pos = src_pos, save_line = src_line, save_col = src_col;
+            Token save_tok = cur_tok;
+            src = mbuf; src_pos = 0; src_line = 1; src_col = 1;
+            advance();
+            Node *mprog = parse_program();
+            Env *menv = env_new(env);
+            hoist_functions(mprog, menv);     /* 模块内部同样享受函数提升 */
+            for (int i = 0; i < mprog->prog.cnt; i++) exec_node(mprog->prog.stmts[i], menv);
+            /* 将模块顶层符号合并到当前环境。
+               注意：env_set 内部已 val_retain，此处不可再手动 retain，
+               否则引用计数永久偏高（内存泄漏）。 */
+            for (int i = 0; i < menv->count; i++) {
+                if (menv->values[i]) {
+                    env_set(env, menv->names[i], menv->values[i]);
+                    if (menv->types[i]) env_set_type(env, menv->names[i], menv->types[i]);
+                }
+            }
+            /* 释放模块执行环境（符号已被调用方环境 retain，释放安全） */
+            env_release(menv);
+            /* 保留模块 AST：其函数体已被合并进调用方环境，释放会导致悬垂指针。
+               改为登记到全局列表，程序结束统一释放。 */
+            if (g_imported_cnt >= g_imported_cap) {
+                g_imported_cap = g_imported_cap ? g_imported_cap*2 : 4;
+                g_imported = realloc(g_imported, g_imported_cap * sizeof(Node*));
+            }
+            g_imported[g_imported_cnt++] = mprog;
+            free(mbuf);
+            /* 恢复词法状态 */
+            src = save_src; src_pos = save_pos; src_line = save_line; src_col = save_col;
+            cur_tok = save_tok;
+            break;
+        }
+        case ND_MATCH: {
+            Value *ev = eval_node(n->match_stmt.expr, env);
+            int matched = 0;
+            for (int a = 0; a < n->match_stmt.arm_cnt && !matched; a++) {
+                MatchArm *arm = &n->match_stmt.arms[a];
+                if (arm->is_default) {
+                    for (int i = 0; i < arm->bcnt; i++) exec_node(arm->body[i], env);
+                    matched = 1;
+                } else {
+                    Value *pv = eval_node(arm->pattern, env);
+                    /* 统一走 val_equals：布尔、列表、字典、张量也能作为匹配模式，
+                       不再只支持整数/浮点/字符串这三种手写组合 */
+                    int eq = val_equals(ev, pv);
+                    val_free(pv);
+                    if (eq) {
+                        for (int i = 0; i < arm->bcnt; i++) exec_node(arm->body[i], env);
+                        matched = 1;
+                    }
+                }
+            }
+            if (!matched) {
+                /* 无默认分支且未匹配：静默跳过（与多数语言一致） */
+            }
+            val_free(ev);
             break;
         }
         case ND_BREAK: {
@@ -2832,6 +4613,7 @@ static void exec_node(Node *n, Env *env) {
 /* ========== 主程序 ========== */
 int main(int argc, char **argv) {
     srand((unsigned int)time(NULL));
+    env_lock_init();
     
     if (argc < 2) {
         fprintf(stderr, "用法: co <脚本.co>\n");
@@ -2865,17 +4647,21 @@ int main(int argc, char **argv) {
 
     Node *prog = parse_program();
     Env *global = env_new(NULL);
+    g_root_env = global;              /* 高阶函数回调时的父环境 */
+    g_call_fn  = call_fn_value;       /* 注入用户函数调用能力给内置高阶函数 */
+
+    hoist_functions(prog, global);    /* 函数提升：定义顺序不再限制调用 */
 
     for (int i = 0; i < prog->prog.cnt; i++) {
         exec_node(prog->prog.stmts[i], global);
     }
 
-    for (int i = 0; i < global->count; i++) {
-        free(global->names[i]);
-        val_free(global->values[i]);
-    }
-    free(global);
+    g_root_env = NULL;
+    env_release(global);
     node_free(prog);
+    /* 统一释放已导入模块的 AST（其函数体此前被合并进全局环境） */
+    for (int i = 0; i < g_imported_cnt; i++) node_free(g_imported[i]);
+    free(g_imported);
     free(buf);
     return 0;
 }

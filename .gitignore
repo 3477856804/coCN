@@ -1,2 +1,6 @@
 co
+co_asan
+co_tsan
+core.*
 *.o
+*.dSYM/
