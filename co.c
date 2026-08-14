@@ -24,13 +24,23 @@ typedef enum {
     VAL_LIST, VAL_TENSOR, VAL_FUNC, VAL_MAP
 } ValType;
 
-/* 张量结构 */
-typedef struct {
-    float *data;
-    int   *shape;
-    int    ndim;
-    int    size;
+/* 张量结构（含自动求导所需字段） */
+typedef struct Tensor {
+    float *data;        /* 数值存储（行主序） */
+    float *grad;        /* 梯度缓冲，按需分配 */
+    int   *shape;       /* 各维度大小 */
+    int    ndim;        /* 维度数 */
+    int    size;        /* 元素总数 */
+    int    requires_grad; /* 是否需要梯度 */
+    int    tref;        /* 张量引用计数 */
+    int    _tag;        /* 反向传播拓扑标记（临时） */
+    struct Tensor **children; /* 计算图子节点 */
+    int    nchildren;   /* 子节点数量 */
+    void  (*backward)(struct Tensor*); /* 反向传播函数 */
 } Tensor;
+
+/* 前向声明：张量释放（带引用计数） */
+static void tensor_free(Tensor *t);
 
 /* 字典条目 */
 typedef struct DictEntry {
@@ -110,9 +120,7 @@ void val_free(Value *v) {
             free(v->lval);
             break;
         case VAL_TENSOR:
-            free(v->tval->data);
-            free(v->tval->shape);
-            free(v->tval);
+            tensor_free(v->tval);
             break;
         case VAL_MAP: {
             for (int i = 0; i < MAX_DICT_SIZE; i++) {
@@ -124,6 +132,12 @@ void val_free(Value *v) {
             free(v->mval);
             break;
         }
+        case VAL_FUNC:
+            if (v->fnval) {
+                free(v->fnval->name);
+                free(v->fnval);
+            }
+            break;
         default: break;
     }
     free(v);
@@ -174,7 +188,36 @@ static char *val_to_string(Value *v) {
             return s;
         }
         case VAL_FUNC: sprintf(buf, "<函数 %s>", v->fnval->name); return strdup(buf);
-        case VAL_TENSOR: sprintf(buf, "<张量 shape=%dx%d>", v->tval->shape[0], v->tval->ndim > 1 ? v->tval->shape[1] : 1); return strdup(buf);
+        case VAL_TENSOR: {
+            Tensor *t = v->tval;
+            char *s = malloc(8192);
+            s[0] = '\0';
+            if (t->ndim == 1) {
+                strcat(s, "[");
+                for (int i = 0; i < t->size; i++) {
+                    char b[32]; snprintf(b, sizeof(b), "%g", t->data[i]);
+                    strcat(s, b);
+                    if (i < t->size - 1) strcat(s, ", ");
+                }
+                strcat(s, "]");
+            } else if (t->ndim == 2) {
+                strcat(s, "[");
+                for (int i = 0; i < t->shape[0]; i++) {
+                    strcat(s, "[");
+                    for (int j = 0; j < t->shape[1]; j++) {
+                        char b[32]; snprintf(b, sizeof(b), "%g", t->data[i * t->shape[1] + j]);
+                        strcat(s, b);
+                        if (j < t->shape[1] - 1) strcat(s, ", ");
+                    }
+                    strcat(s, "]");
+                    if (i < t->shape[0] - 1) strcat(s, ", ");
+                }
+                strcat(s, "]");
+            } else {
+                snprintf(s, 8192, "<张量 shape=%dx%d>", t->shape[0], t->ndim > 1 ? t->shape[1] : 1);
+            }
+            return s;
+        }
         default: return strdup("<未知>");
     }
 }
@@ -216,7 +259,7 @@ static void dict_set(Map *m, const char *key, Value *val) {
 
 /* ========== 张量操作 ========== */
 static Tensor *tensor_new(int ndim, int *shape) {
-    Tensor *t = malloc(sizeof(Tensor));
+    Tensor *t = calloc(1, sizeof(Tensor));
     t->ndim = ndim;
     t->shape = malloc(ndim * sizeof(int));
     int size = 1;
@@ -226,7 +269,44 @@ static Tensor *tensor_new(int ndim, int *shape) {
     }
     t->size = size;
     t->data = calloc(size, sizeof(float));
+    t->grad = NULL;
+    t->requires_grad = 0;
+    t->tref = 1;
+    t->_tag = 0;
+    t->children = NULL;
+    t->nchildren = 0;
+    t->backward = NULL;
     return t;
+}
+
+/* 张量引用计数保留 */
+static Tensor *tensor_retain(Tensor *t) { if (t) t->tref++; return t; }
+
+/* 张量引用计数释放 */
+static void tensor_free(Tensor *t) {
+    if (!t) return;
+    t->tref--;
+    if (t->tref > 0) return;
+    if (t->children) {
+        for (int i = 0; i < t->nchildren; i++) tensor_free(t->children[i]);
+        free(t->children);
+    }
+    free(t->data);
+    free(t->grad);
+    free(t->shape);
+    free(t);
+}
+
+/* 确保梯度缓冲已分配并清零 */
+static void ensure_grad(Tensor *t) {
+    if (!t->grad) t->grad = calloc(t->size, sizeof(float));
+}
+
+/* 向父节点挂接子节点（保留引用） */
+static void tensor_set_child(Tensor *parent, Tensor *child) {
+    if (!child) return;
+    parent->children = realloc(parent->children, (parent->nchildren + 1) * sizeof(Tensor*));
+    parent->children[parent->nchildren++] = tensor_retain(child);
 }
 
 /* ========== 环境操作 ========== */
@@ -571,6 +651,75 @@ typedef struct Node {
     };
 } Node;
 
+/* 释放整棵 AST（用于程序结束清理，避免退出时内存泄漏） */
+static void node_free(Node *n) {
+    if (!n) return;
+    switch (n->type) {
+        case ND_PROGRAM:
+            for (int i = 0; i < n->prog.cnt; i++) node_free(n->prog.stmts[i]);
+            free(n->prog.stmts); break;
+        case ND_VAR_DECL:
+            free(n->var_decl.name);
+            if (n->var_decl.init) node_free(n->var_decl.init);
+            break;
+        case ND_ASSIGN:
+            node_free(n->assign.tgt); node_free(n->assign.val); break;
+        case ND_IDENT:
+            free(n->ident.name); break;
+        case ND_FUNC_DEF:
+            free(n->func_def.name);
+            for (int i = 0; i < n->func_def.pcnt; i++) free(n->func_def.pnames[i]);
+            free(n->func_def.pnames);
+            node_free(n->func_def.body);
+            break;
+        case ND_FUNC_CALL:
+            node_free(n->func_call.callee);
+            for (int i = 0; i < n->func_call.acnt; i++) node_free(n->func_call.args[i]);
+            free(n->func_call.args);
+            break;
+        case ND_RETURN:
+            if (n->ret_stmt.val) node_free(n->ret_stmt.val);
+            break;
+        case ND_IF:
+            node_free(n->if_stmt.cond);
+            for (int i = 0; i < n->if_stmt.tcnt; i++) node_free(n->if_stmt.then_body[i]);
+            free(n->if_stmt.then_body);
+            for (int b = 0; b < n->if_stmt.br_cnt; b++) {
+                ElseBranch *eb = &n->if_stmt.else_branches[b];
+                if (eb->cond) node_free(eb->cond);
+                for (int i = 0; i < eb->bcnt; i++) node_free(eb->body[i]);
+                free(eb->body);
+            }
+            free(n->if_stmt.else_branches);
+            break;
+        case ND_WHILE:
+            node_free(n->while_stmt.cond);
+            for (int i = 0; i < n->while_stmt.bcnt; i++) node_free(n->while_stmt.body[i]);
+            free(n->while_stmt.body); break;
+        case ND_FOR:
+            free(n->for_stmt.var);
+            if (n->for_stmt.start) node_free(n->for_stmt.start);
+            if (n->for_stmt.end) node_free(n->for_stmt.end);
+            if (n->for_stmt.step) node_free(n->for_stmt.step);
+            for (int i = 0; i < n->for_stmt.bcnt; i++) node_free(n->for_stmt.body[i]);
+            free(n->for_stmt.body); break;
+        case ND_BINARY:
+            node_free(n->binary.left); node_free(n->binary.right); break;
+        case ND_UNARY:
+            node_free(n->unary.operand); break;
+        case ND_LITERAL:
+            free(n->literal.value); break;
+        case ND_LIST_LIT:
+            for (int i = 0; i < n->list_lit.ecnt; i++) node_free(n->list_lit.elements[i]);
+            free(n->list_lit.elements); break;
+        case ND_MAP_LIT:
+            for (int i = 0; i < n->map_lit.kcnt; i++) { node_free(n->map_lit.keys[i]); node_free(n->map_lit.vals[i]); }
+            free(n->map_lit.keys); free(n->map_lit.vals); break;
+        default: break;
+    }
+    free(n);
+}
+
 /* ========== 语法分析器 ========== */
 static Node *parse_expression();
 static Node *parse_statement();
@@ -607,6 +756,12 @@ static Node *parse_primary() {
     } else if (cur_tok.type == TOK_ID) {
         Node *n = make_node(ND_IDENT);
         n->ident.name = strdup(cur_tok.text);
+        advance();
+        return n;
+    } else if (cur_tok.type == TK_TENSOR) {
+        /* 张量(...) 当作名为 "张量" 的内置函数调用 */
+        Node *n = make_node(ND_IDENT);
+        n->ident.name = strdup("张量");
         advance();
         return n;
     } else if (cur_tok.type == TOK_LPAREN) {
@@ -937,7 +1092,11 @@ static Node *parse_while() {
 
 static Node *parse_for() {
     advance();
-    expect(TOK_ID);
+    if (cur_tok.type != TOK_ID) {
+        fprintf(stderr, "语法错误 (第%d行,第%d列): 循环变量需要标识符, 得到 '%s'\n",
+                cur_tok.line, cur_tok.col, cur_tok.text);
+        exit(1);
+    }
     char *var = strdup(cur_tok.text);
     advance();
     expect(TK_FROM);
@@ -1415,6 +1574,682 @@ static Value *builtin_substring(int argc, Value **argv) {
     return result;
 }
 
+/* ========== 自动求导 / 张量算子 ========== */
+#define CO_MAX_DIM 8
+
+/* 广播形状计算（numpy 风格，末尾对齐）；失败返回 -1 */
+static int bc_shape(const int *a, int na, const int *b, int nb, int *out) {
+    int ondim = na > nb ? na : nb;
+    for (int i = 0; i < ondim; i++) {
+        int da = (i < ondim - na) ? 1 : a[i - (ondim - na)];
+        int db = (i < ondim - nb) ? 1 : b[i - (ondim - nb)];
+        if (da != db && da != 1 && db != 1) return -1;
+        out[i] = da > db ? da : db;
+    }
+    return ondim;
+}
+
+/* 将输出扁平索引映射到某个子节点的扁平索引（处理广播） */
+static int bc_child_index(int out_flat, const int *out_shape, int ondim,
+                          const int *c_shape, int cndim) {
+    int coords[CO_MAX_DIM];
+    int rem = out_flat;
+    for (int i = ondim - 1; i >= 0; i--) { coords[i] = rem % out_shape[i]; rem /= out_shape[i]; }
+    int coff = ondim - cndim;
+    int cidx = 0;
+    for (int i = 0; i < cndim; i++) {
+        int oi = coff + i;
+        int cd = c_shape[i];
+        int ci = (cd == 1) ? 0 : coords[oi];
+        cidx = cidx * cd + ci;
+    }
+    return cidx;
+}
+
+/* ---------- 逐元素广播算子 ---------- */
+static void t_add_bw(Tensor *c) {
+    Tensor *a = c->children[0], *b = c->children[1];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int oi = 0; oi < c->size; oi++) a->grad[bc_child_index(oi, c->shape, c->ndim, a->shape, a->ndim)] += c->grad[oi];
+    }
+    if (b->requires_grad) { ensure_grad(b);
+        for (int oi = 0; oi < c->size; oi++) b->grad[bc_child_index(oi, c->shape, c->ndim, b->shape, b->ndim)] += c->grad[oi];
+    }
+}
+static Tensor *t_add(Tensor *a, Tensor *b) {
+    int out[CO_MAX_DIM]; int ondim = bc_shape(a->shape, a->ndim, b->shape, b->ndim, out);
+    if (ondim < 0) return NULL;
+    Tensor *c = tensor_new(ondim, out);
+    for (int oi = 0; oi < c->size; oi++) {
+        int ia = bc_child_index(oi, out, ondim, a->shape, a->ndim);
+        int ib = bc_child_index(oi, out, ondim, b->shape, b->ndim);
+        c->data[oi] = a->data[ia] + b->data[ib];
+    }
+    c->requires_grad = a->requires_grad || b->requires_grad;
+    c->backward = t_add_bw; tensor_set_child(c, a); tensor_set_child(c, b);
+    return c;
+}
+
+static void t_sub_bw(Tensor *c) {
+    Tensor *a = c->children[0], *b = c->children[1];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int oi = 0; oi < c->size; oi++) a->grad[bc_child_index(oi, c->shape, c->ndim, a->shape, a->ndim)] += c->grad[oi];
+    }
+    if (b->requires_grad) { ensure_grad(b);
+        for (int oi = 0; oi < c->size; oi++) b->grad[bc_child_index(oi, c->shape, c->ndim, b->shape, b->ndim)] -= c->grad[oi];
+    }
+}
+static Tensor *t_sub(Tensor *a, Tensor *b) {
+    int out[CO_MAX_DIM]; int ondim = bc_shape(a->shape, a->ndim, b->shape, b->ndim, out);
+    if (ondim < 0) return NULL;
+    Tensor *c = tensor_new(ondim, out);
+    for (int oi = 0; oi < c->size; oi++) {
+        int ia = bc_child_index(oi, out, ondim, a->shape, a->ndim);
+        int ib = bc_child_index(oi, out, ondim, b->shape, b->ndim);
+        c->data[oi] = a->data[ia] - b->data[ib];
+    }
+    c->requires_grad = a->requires_grad || b->requires_grad;
+    c->backward = t_sub_bw; tensor_set_child(c, a); tensor_set_child(c, b);
+    return c;
+}
+
+static void t_mul_bw(Tensor *c) {
+    Tensor *a = c->children[0], *b = c->children[1];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int oi = 0; oi < c->size; oi++) {
+            int ia = bc_child_index(oi, c->shape, c->ndim, a->shape, a->ndim);
+            int ib = bc_child_index(oi, c->shape, c->ndim, b->shape, b->ndim);
+            a->grad[ia] += c->grad[oi] * b->data[ib];
+        }
+    }
+    if (b->requires_grad) { ensure_grad(b);
+        for (int oi = 0; oi < c->size; oi++) {
+            int ia = bc_child_index(oi, c->shape, c->ndim, a->shape, a->ndim);
+            int ib = bc_child_index(oi, c->shape, c->ndim, b->shape, b->ndim);
+            b->grad[ib] += c->grad[oi] * a->data[ia];
+        }
+    }
+}
+static Tensor *t_mul(Tensor *a, Tensor *b) {
+    int out[CO_MAX_DIM]; int ondim = bc_shape(a->shape, a->ndim, b->shape, b->ndim, out);
+    if (ondim < 0) return NULL;
+    Tensor *c = tensor_new(ondim, out);
+    for (int oi = 0; oi < c->size; oi++) {
+        int ia = bc_child_index(oi, out, ondim, a->shape, a->ndim);
+        int ib = bc_child_index(oi, out, ondim, b->shape, b->ndim);
+        c->data[oi] = a->data[ia] * b->data[ib];
+    }
+    c->requires_grad = a->requires_grad || b->requires_grad;
+    c->backward = t_mul_bw; tensor_set_child(c, a); tensor_set_child(c, b);
+    return c;
+}
+
+static void t_div_bw(Tensor *c) {
+    Tensor *a = c->children[0], *b = c->children[1];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int oi = 0; oi < c->size; oi++) {
+            int ia = bc_child_index(oi, c->shape, c->ndim, a->shape, a->ndim);
+            int ib = bc_child_index(oi, c->shape, c->ndim, b->shape, b->ndim);
+            a->grad[ia] += c->grad[oi] / (b->data[ib] + 1e-12f);
+        }
+    }
+    if (b->requires_grad) { ensure_grad(b);
+        for (int oi = 0; oi < c->size; oi++) {
+            int ia = bc_child_index(oi, c->shape, c->ndim, a->shape, a->ndim);
+            int ib = bc_child_index(oi, c->shape, c->ndim, b->shape, b->ndim);
+            b->grad[ib] += -c->grad[oi] * a->data[ia] / ((b->data[ib] * b->data[ib]) + 1e-12f);
+        }
+    }
+}
+static Tensor *t_div(Tensor *a, Tensor *b) {
+    int out[CO_MAX_DIM]; int ondim = bc_shape(a->shape, a->ndim, b->shape, b->ndim, out);
+    if (ondim < 0) return NULL;
+    Tensor *c = tensor_new(ondim, out);
+    for (int oi = 0; oi < c->size; oi++) {
+        int ia = bc_child_index(oi, out, ondim, a->shape, a->ndim);
+        int ib = bc_child_index(oi, out, ondim, b->shape, b->ndim);
+        c->data[oi] = a->data[ia] / (b->data[ib] + 1e-12f);
+    }
+    c->requires_grad = a->requires_grad || b->requires_grad;
+    c->backward = t_div_bw; tensor_set_child(c, a); tensor_set_child(c, b);
+    return c;
+}
+
+/* ---------- 矩阵乘法 ---------- */
+static void t_matmul_bw(Tensor *c) {
+    Tensor *a = c->children[0], *b = c->children[1];
+    int m = a->shape[0], K = a->shape[1], n = b->shape[1];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int i = 0; i < m; i++) for (int k = 0; k < K; k++) for (int j = 0; j < n; j++)
+            a->grad[i * K + k] += c->grad[i * n + j] * b->data[k * n + j];
+    }
+    if (b->requires_grad) { ensure_grad(b);
+        for (int i = 0; i < m; i++) for (int k = 0; k < K; k++) for (int j = 0; j < n; j++)
+            b->grad[k * n + j] += a->data[i * K + k] * c->grad[i * n + j];
+    }
+}
+static Tensor *t_matmul(Tensor *a, Tensor *b) {
+    if (a->ndim != 2 || b->ndim != 2 || a->shape[1] != b->shape[0]) return NULL;
+    int m = a->shape[0], K = a->shape[1], n = b->shape[1];
+    int sh[2] = { m, n };
+    Tensor *c = tensor_new(2, sh);
+    for (int i = 0; i < m; i++) for (int j = 0; j < n; j++) {
+        float s = 0; for (int k = 0; k < K; k++) s += a->data[i * K + k] * b->data[k * n + j];
+        c->data[i * n + j] = s;
+    }
+    c->requires_grad = a->requires_grad || b->requires_grad;
+    c->backward = t_matmul_bw; tensor_set_child(c, a); tensor_set_child(c, b);
+    return c;
+}
+
+/* ---------- 转置 ---------- */
+static void t_transpose_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a);
+        int m = a->shape[0], n = a->shape[1];
+        for (int i = 0; i < m; i++) for (int j = 0; j < n; j++)
+            a->grad[i * n + j] += c->grad[j * m + i];
+    }
+}
+static Tensor *t_transpose(Tensor *a) {
+    if (a->ndim != 2) return NULL;
+    int m = a->shape[0], n = a->shape[1];
+    int sh[2] = { n, m };
+    Tensor *c = tensor_new(2, sh);
+    for (int i = 0; i < m; i++) for (int j = 0; j < n; j++) c->data[j * m + i] = a->data[i * n + j];
+    c->requires_grad = a->requires_grad; c->backward = t_transpose_bw; tensor_set_child(c, a);
+    return c;
+}
+
+/* ---------- 求和 / 均值 ---------- */
+static void t_sum_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a); float g = c->grad[0];
+        for (int i = 0; i < a->size; i++) a->grad[i] += g;
+    }
+}
+static Tensor *t_sum(Tensor *a) {
+    int sh[1] = { 1 }; Tensor *c = tensor_new(1, sh);
+    float s = 0; for (int i = 0; i < a->size; i++) s += a->data[i];
+    c->data[0] = s;
+    c->requires_grad = a->requires_grad; c->backward = t_sum_bw; tensor_set_child(c, a);
+    return c;
+}
+static void t_mean_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a); float g = c->grad[0] / a->size;
+        for (int i = 0; i < a->size; i++) a->grad[i] += g;
+    }
+}
+static Tensor *t_mean(Tensor *a) {
+    int sh[1] = { 1 }; Tensor *c = tensor_new(1, sh);
+    float s = 0; for (int i = 0; i < a->size; i++) s += a->data[i];
+    c->data[0] = s / a->size;
+    c->requires_grad = a->requires_grad; c->backward = t_mean_bw; tensor_set_child(c, a);
+    return c;
+}
+
+/* ---------- 逐元素激活 / 数学 ---------- */
+static void t_sigmoid_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int i = 0; i < a->size; i++) { float x = a->data[i]; float s = 1.0f / (1.0f + expf(-x)); a->grad[i] += s * (1 - s) * c->grad[i]; }
+    }
+}
+static Tensor *t_sigmoid(Tensor *a) {
+    Tensor *c = tensor_new(a->ndim, a->shape);
+    for (int i = 0; i < a->size; i++) c->data[i] = 1.0f / (1.0f + expf(-a->data[i]));
+    c->requires_grad = a->requires_grad; c->backward = t_sigmoid_bw; tensor_set_child(c, a);
+    return c;
+}
+static void t_tanh_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int i = 0; i < a->size; i++) { float t = tanhf(a->data[i]); a->grad[i] += (1 - t * t) * c->grad[i]; }
+    }
+}
+static Tensor *t_tanh(Tensor *a) {
+    Tensor *c = tensor_new(a->ndim, a->shape);
+    for (int i = 0; i < a->size; i++) c->data[i] = tanhf(a->data[i]);
+    c->requires_grad = a->requires_grad; c->backward = t_tanh_bw; tensor_set_child(c, a);
+    return c;
+}
+static void t_relu_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int i = 0; i < a->size; i++) if (a->data[i] > 0) a->grad[i] += c->grad[i];
+    }
+}
+static Tensor *t_relu(Tensor *a) {
+    Tensor *c = tensor_new(a->ndim, a->shape);
+    for (int i = 0; i < a->size; i++) c->data[i] = a->data[i] > 0 ? a->data[i] : 0;
+    c->requires_grad = a->requires_grad; c->backward = t_relu_bw; tensor_set_child(c, a);
+    return c;
+}
+static void t_exp_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int i = 0; i < a->size; i++) a->grad[i] += c->data[i] * c->grad[i];
+    }
+}
+static Tensor *t_exp(Tensor *a) {
+    Tensor *c = tensor_new(a->ndim, a->shape);
+    for (int i = 0; i < a->size; i++) c->data[i] = expf(a->data[i]);
+    c->requires_grad = a->requires_grad; c->backward = t_exp_bw; tensor_set_child(c, a);
+    return c;
+}
+static void t_log_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a);
+        for (int i = 0; i < a->size; i++) a->grad[i] += c->grad[i] / (a->data[i] + 1e-12f);
+    }
+}
+static Tensor *t_log(Tensor *a) {
+    Tensor *c = tensor_new(a->ndim, a->shape);
+    for (int i = 0; i < a->size; i++) c->data[i] = logf(a->data[i] + 1e-12f);
+    c->requires_grad = a->requires_grad; c->backward = t_log_bw; tensor_set_child(c, a);
+    return c;
+}
+static void t_softmax_bw(Tensor *c) {
+    Tensor *a = c->children[0];
+    if (a->requires_grad) { ensure_grad(a);
+        int rows = (a->ndim == 1) ? 1 : a->shape[0];
+        int cols = (a->ndim == 1) ? a->size : a->shape[1];
+        for (int r = 0; r < rows; r++) {
+            float s = 0;
+            for (int k = 0; k < cols; k++) { int idx = (a->ndim == 1) ? k : (r * cols + k); s += c->grad[idx] * c->data[idx]; }
+            for (int k = 0; k < cols; k++) { int idx = (a->ndim == 1) ? k : (r * cols + k); a->grad[idx] += c->data[idx] * (c->grad[idx] - s); }
+        }
+    }
+}
+static Tensor *t_softmax(Tensor *a) {
+    int rows = (a->ndim == 1) ? 1 : a->shape[0];
+    int cols = (a->ndim == 1) ? a->size : a->shape[1];
+    Tensor *c = tensor_new(a->ndim, a->shape);
+    for (int r = 0; r < rows; r++) {
+        float mx = -1e30f;
+        for (int k = 0; k < cols; k++) { int idx = (a->ndim == 1) ? k : (r * cols + k); if (a->data[idx] > mx) mx = a->data[idx]; }
+        float sum = 0;
+        for (int k = 0; k < cols; k++) { int idx = (a->ndim == 1) ? k : (r * cols + k); float e = expf(a->data[idx] - mx); c->data[idx] = e; sum += e; }
+        for (int k = 0; k < cols; k++) { int idx = (a->ndim == 1) ? k : (r * cols + k); c->data[idx] /= sum; }
+    }
+    c->requires_grad = a->requires_grad; c->backward = t_softmax_bw; tensor_set_child(c, a);
+    return c;
+}
+
+/* ---------- 损失函数 ---------- */
+static void t_mse_bw(Tensor *c) {
+    Tensor *a = c->children[0], *b = c->children[1];
+    int n = a->size; float inv = c->grad[0] / n;
+    if (a->requires_grad) { ensure_grad(a);
+        for (int i = 0; i < n; i++) a->grad[i] += 2.0f * (a->data[i] - b->data[i]) * inv;
+    }
+    if (b->requires_grad) { ensure_grad(b);
+        for (int i = 0; i < n; i++) b->grad[i] += -2.0f * (a->data[i] - b->data[i]) * inv;
+    }
+}
+static Tensor *t_mse(Tensor *a, Tensor *b) {
+    if (a->size != b->size) return NULL;
+    int sh[1] = { 1 }; Tensor *c = tensor_new(1, sh);
+    float s = 0; for (int i = 0; i < a->size; i++) { float d = a->data[i] - b->data[i]; s += d * d; }
+    c->data[0] = s / a->size;
+    c->requires_grad = a->requires_grad || b->requires_grad; c->backward = t_mse_bw; tensor_set_child(c, a); tensor_set_child(c, b);
+    return c;
+}
+static int ce_label(Tensor *lab, int r) {
+    return (lab->ndim == 1) ? (int)lab->data[r] : (int)lab->data[r * lab->shape[1]];
+}
+static void t_ce_bw(Tensor *c) {
+    Tensor *p = c->children[0], *lab = c->children[1];
+    if (p->requires_grad) { ensure_grad(p);
+        int rows = p->shape[0], cols = p->shape[1], N = rows;
+        for (int r = 0; r < rows; r++) {
+            int k = ce_label(lab, r);
+            p->grad[r * cols + k] += -1.0f / (N * (p->data[r * cols + k] + 1e-12f)) * c->grad[0];
+        }
+    }
+}
+static Tensor *t_cross_entropy(Tensor *p, Tensor *lab) {
+    if (p->ndim != 2) return NULL;
+    int rows = p->shape[0], cols = p->shape[1], N = rows;
+    int sh[1] = { 1 }; Tensor *c = tensor_new(1, sh);
+    float s = 0;
+    for (int r = 0; r < rows; r++) { int k = ce_label(lab, r); s += -logf(p->data[r * cols + k] + 1e-12f); }
+    c->data[0] = s / N;
+    c->requires_grad = p->requires_grad; c->backward = t_ce_bw; tensor_set_child(c, p); tensor_set_child(c, lab);
+    return c;
+}
+static void t_cel_bw(Tensor *c) {
+    Tensor *lg = c->children[0], *lab = c->children[1];
+    if (lg->requires_grad) { ensure_grad(lg);
+        int rows = lg->shape[0], cols = lg->shape[1], N = rows;
+        float *prob = malloc(cols * sizeof(float));
+        for (int r = 0; r < rows; r++) {
+            float mx = -1e30f;
+            for (int k = 0; k < cols; k++) { int idx = r * cols + k; if (lg->data[idx] > mx) mx = lg->data[idx]; }
+            float sum = 0;
+            for (int k = 0; k < cols; k++) { int idx = r * cols + k; float e = expf(lg->data[idx] - mx); prob[k] = e; sum += e; }
+            int k = ce_label(lab, r);
+            for (int kk = 0; kk < cols; kk++) { int idx = r * cols + kk; lg->grad[idx] += (prob[kk] / sum - (kk == k ? 1.0f : 0.0f)) / N * c->grad[0]; }
+        }
+        free(prob);
+    }
+}
+static Tensor *t_cross_entropy_logits(Tensor *lg, Tensor *lab) {
+    if (lg->ndim != 2) return NULL;
+    int rows = lg->shape[0], cols = lg->shape[1], N = rows;
+    int sh[1] = { 1 }; Tensor *c = tensor_new(1, sh);
+    float s = 0;
+    for (int r = 0; r < rows; r++) {
+        float mx = -1e30f;
+        for (int k = 0; k < cols; k++) { int idx = r * cols + k; if (lg->data[idx] > mx) mx = lg->data[idx]; }
+        float sum = 0;
+        for (int k = 0; k < cols; k++) { int idx = r * cols + k; sum += expf(lg->data[idx] - mx); }
+        int k = ce_label(lab, r);
+        s += -(lg->data[r * cols + k] - mx) + logf(sum);
+    }
+    c->data[0] = s / N;
+    c->requires_grad = lg->requires_grad; c->backward = t_cel_bw; tensor_set_child(c, lg); tensor_set_child(c, lab);
+    return c;
+}
+
+/* ---------- 反向传播引擎 ---------- */
+static void topo_visit(Tensor *t, Tensor ***out, int *n, int *cap) {
+    if (!t || t->_tag == 2) return;
+    if (t->_tag == 1) return;
+    t->_tag = 1;
+    for (int i = 0; i < t->nchildren; i++) topo_visit(t->children[i], out, n, cap);
+    t->_tag = 2;
+    if (*n >= *cap) { *cap = *cap ? *cap * 2 : 16; *out = realloc(*out, (*cap) * sizeof(Tensor*)); }
+    (*out)[(*n)++] = t;
+}
+static void tensor_backward(Tensor *root) {
+    Tensor **order = NULL; int n = 0, cap = 0;
+    topo_visit(root, &order, &n, &cap);
+    for (int i = 0; i < n; i++) ensure_grad(order[i]);
+    ensure_grad(root);
+    for (int i = 0; i < root->size; i++) root->grad[i] = 1.0f;
+    for (int i = n - 1; i >= 0; i--) if (order[i]->backward) order[i]->backward(order[i]);
+    for (int i = 0; i < n; i++) order[i]->_tag = 0;
+    root->_tag = 0;
+    free(order);
+}
+
+/* 表达式层：两个张量的二元运算（自动求导） */
+static Value *tensor_elem_binop(Node *n, const char *op, Value *l, Value *r) {
+    Tensor *a = l->tval, *b = r->tval;
+    Tensor *c = NULL;
+    if (strcmp(op, "+") == 0) c = t_add(a, b);
+    else if (strcmp(op, "-") == 0) c = t_sub(a, b);
+    else if (strcmp(op, "*") == 0) c = t_mul(a, b);
+    else if (strcmp(op, "/") == 0) c = t_div(a, b);
+    else runtime_error(n, "无效的张量运算符: %s", op);
+    if (!c) runtime_error(n, "张量形状无法广播（维度不匹配）");
+    Value *tv = val_new(VAL_TENSOR); tv->tval = c;
+    return tv;
+}
+
+/* 赋值到张量元素：t[i][j] = v 或 t[i] = v */
+static int assign_tensor(Node *tgt, Value *val, Env *env) {
+    if (tgt->type != ND_BINARY || strcmp(tgt->binary.op, "[]") != 0) return 0;
+    Node *inner = tgt->binary.left;
+    if (inner->type == ND_BINARY && strcmp(inner->binary.op, "[]") == 0 && inner->binary.left->type == ND_IDENT) {
+        char *name = inner->binary.left->ident.name;
+        Value *i1 = eval_node(inner->binary.right, env);
+        Value *i2 = eval_node(tgt->binary.right, env);
+        Value *base = env_get(env, name);
+        if (base && base->type == VAL_TENSOR && base->tval->ndim == 2) {
+            int r = (int)i1->ival, c = (int)i2->ival;
+            int cols = base->tval->shape[1];
+            if (r < 0 || r >= base->tval->shape[0] || c < 0 || c >= cols) runtime_error(tgt, "张量索引越界");
+            double v = (val->type == VAL_FLOAT) ? val->fval : (val->type == VAL_INT ? val->ival : 0);
+            base->tval->data[r * cols + c] = (float)v;
+            val_free(i1); val_free(i2);
+            return 1;
+        }
+        val_free(i1); val_free(i2);
+        return 0;
+    }
+    if (inner->type == ND_IDENT) {
+        Value *idx = eval_node(tgt->binary.right, env);
+        Value *base = env_get(env, inner->ident.name);
+        if (base && base->type == VAL_TENSOR && base->tval->ndim == 1) {
+            int i = (int)idx->ival;
+            if (i < 0 || i >= base->tval->size) runtime_error(tgt, "张量索引越界");
+            double v = (val->type == VAL_FLOAT) ? val->fval : (val->type == VAL_INT ? val->ival : 0);
+            base->tval->data[i] = (float)v;
+            val_free(idx);
+            return 1;
+        }
+        val_free(idx);
+        return 0;
+    }
+    return 0;
+}
+
+/* ========== 张量 / ML 内置函数 ========== */
+static double list_val(Value *v) {
+    if (v->type == VAL_FLOAT) return v->fval;
+    if (v->type == VAL_INT) return (double)v->ival;
+    return 0.0;
+}
+static int *compute_shape(Value *v, int *ndim) {
+    if (v->type != VAL_LIST) { *ndim = 0; return NULL; }
+    int child_ndim = 0; int *child_shape = NULL;
+    if (v->list_len > 0 && v->lval[0]->type == VAL_LIST)
+        child_shape = compute_shape(v->lval[0], &child_ndim);
+    *ndim = 1 + child_ndim;
+    int *shape = malloc((*ndim) * sizeof(int));
+    shape[0] = v->list_len;
+    for (int i = 0; i < child_ndim; i++) shape[1 + i] = child_shape[i];
+    free(child_shape);
+    return shape;
+}
+static void fill_tensor(Tensor *t, Value *v, int *coord, int dim) {
+    if (dim == t->ndim) {
+        int flat = 0;
+        for (int i = 0; i < t->ndim; i++) flat = flat * t->shape[i] + coord[i];
+        t->data[flat] = (float)list_val(v);
+        return;
+    }
+    for (int i = 0; i < v->list_len; i++) { coord[dim] = i; fill_tensor(t, v->lval[i], coord, dim + 1); }
+}
+
+/* 张量(嵌套列表) 构造；张量(一维数字列表) 构造 1D；张量(n) 构造 1D 零张量；张量(r,c) 构造 r×c 零张量 */
+static Value *builtin_tensor(int argc, Value **argv) {
+    if (argc == 1) {
+        Value *a = argv[0];
+        if (a->type == VAL_LIST) {
+            if (a->list_len > 0 && a->lval[0]->type == VAL_LIST) {
+                int ndim = 0; int *shape = compute_shape(a, &ndim);
+                Tensor *t = tensor_new(ndim, shape);
+                int *coord = calloc(ndim, sizeof(int));
+                fill_tensor(t, a, coord, 0);
+                free(coord); free(shape);
+                Value *r = val_new(VAL_TENSOR); r->tval = t; return r;
+            } else {
+                int sh[1] = { a->list_len };
+                Tensor *t = tensor_new(1, sh);
+                for (int i = 0; i < a->list_len; i++) t->data[i] = (float)list_val(a->lval[i]);
+                Value *r = val_new(VAL_TENSOR); r->tval = t; return r;
+            }
+        } else if (a->type == VAL_INT) {
+            int sh[1] = { (int)a->ival };
+            Tensor *t = tensor_new(1, sh);
+            Value *r = val_new(VAL_TENSOR); r->tval = t; return r;
+        }
+    } else if (argc == 2 && argv[0]->type == VAL_INT && argv[1]->type == VAL_INT) {
+        int sh[2] = { (int)argv[0]->ival, (int)argv[1]->ival };
+        Tensor *t = tensor_new(2, sh);
+        Value *r = val_new(VAL_TENSOR); r->tval = t; return r;
+    }
+    runtime_error(NULL, "张量构造需要: 嵌套列表 / 一维数字列表 / 单个整数 / 两个整数");
+    return val_new(VAL_NULL);
+}
+
+static Value *builtin_zeros(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_LIST) runtime_error(NULL, "全零函数需要形状列表");
+    int ndim = argv[0]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
+    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[0]->lval[i]->ival; size *= sh[i]; }
+    Tensor *c = tensor_new(ndim, sh);
+    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+}
+static Value *builtin_ones(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_LIST) runtime_error(NULL, "全一函数需要形状列表");
+    int ndim = argv[0]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
+    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[0]->lval[i]->ival; size *= sh[i]; }
+    Tensor *c = tensor_new(ndim, sh);
+    for (int i = 0; i < size; i++) c->data[i] = 1.0f;
+    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+}
+static Value *builtin_rand_tensor(int argc, Value **argv) {
+    if (argc != 3 || argv[0]->type != VAL_LIST) runtime_error(NULL, "随机张量需要: 形状列表, 下限, 上限");
+    int ndim = argv[0]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
+    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[0]->lval[i]->ival; size *= sh[i]; }
+    double lo = (argv[1]->type == VAL_FLOAT) ? argv[1]->fval : (double)argv[1]->ival;
+    double hi = (argv[2]->type == VAL_FLOAT) ? argv[2]->fval : (double)argv[2]->ival;
+    Tensor *c = tensor_new(ndim, sh);
+    for (int i = 0; i < size; i++) c->data[i] = (float)(lo + (double)rand() / RAND_MAX * (hi - lo));
+    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+}
+static Value *builtin_randn(int argc, Value **argv) {
+    if (argc != 3 || argv[0]->type != VAL_LIST) runtime_error(NULL, "高斯随机需要: 形状列表, 均值, 标准差");
+    int ndim = argv[0]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
+    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[0]->lval[i]->ival; size *= sh[i]; }
+    double mean = (argv[1]->type == VAL_FLOAT) ? argv[1]->fval : (double)argv[1]->ival;
+    double std = (argv[2]->type == VAL_FLOAT) ? argv[2]->fval : (double)argv[2]->ival;
+    Tensor *c = tensor_new(ndim, sh);
+    for (int i = 0; i < size; i++) {
+        double u1 = ((double)rand() + 1) / ((double)RAND_MAX + 1);
+        double u2 = (double)rand() / RAND_MAX;
+        double z = sqrt(-2 * log(u1)) * cos(2 * 3.14159265358979323846 * u2);
+        c->data[i] = (float)(mean + std * z);
+    }
+    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+}
+static Value *builtin_matmul(int argc, Value **argv) {
+    if (argc != 2 || argv[0]->type != VAL_TENSOR || argv[1]->type != VAL_TENSOR) runtime_error(NULL, "矩阵乘需要两个张量");
+    Tensor *c = t_matmul(argv[0]->tval, argv[1]->tval);
+    if (!c) runtime_error(NULL, "矩阵乘形状不匹配");
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
+}
+static Value *builtin_transpose(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "转置需要1个张量");
+    Tensor *c = t_transpose(argv[0]->tval);
+    if (!c) runtime_error(NULL, "转置仅支持二维张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
+}
+static Value *builtin_shape(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "形状函数需要1个张量");
+    Tensor *t = argv[0]->tval;
+    Value *r = val_new(VAL_LIST); r->list_len = t->ndim; r->lval = malloc(t->ndim * sizeof(Value*));
+    for (int i = 0; i < t->ndim; i++) { Value *e = val_new(VAL_INT); e->ival = t->shape[i]; r->lval[i] = e; }
+    return r;
+}
+static Value *builtin_reshape(int argc, Value **argv) {
+    if (argc != 2 || argv[0]->type != VAL_TENSOR || argv[1]->type != VAL_LIST) runtime_error(NULL, "重塑函数需要: 张量, 形状列表");
+    Tensor *t = argv[0]->tval;
+    int ndim = argv[1]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
+    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[1]->lval[i]->ival; size *= sh[i]; }
+    if (size != t->size) runtime_error(NULL, "重塑前后元素总数不一致");
+    Tensor *c = tensor_new(ndim, sh);
+    memcpy(c->data, t->data, t->size * sizeof(float));
+    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+}
+static Value *builtin_sum(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "求和需要1个张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = t_sum(argv[0]->tval); return r;
+}
+static Value *builtin_mean(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "均值需要1个张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = t_mean(argv[0]->tval); return r;
+}
+static Value *builtin_exp(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "指数需要1个张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = t_exp(argv[0]->tval); return r;
+}
+static Value *builtin_log(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "对数需要1个张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = t_log(argv[0]->tval); return r;
+}
+static Value *builtin_sigmoid(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "西格莫德需要1个张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = t_sigmoid(argv[0]->tval); return r;
+}
+static Value *builtin_tanh(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "双曲正切需要1个张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = t_tanh(argv[0]->tval); return r;
+}
+static Value *builtin_relu(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "线性整流需要1个张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = t_relu(argv[0]->tval); return r;
+}
+static Value *builtin_softmax(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "柔性最大值需要1个张量");
+    Value *r = val_new(VAL_TENSOR); r->tval = t_softmax(argv[0]->tval); return r;
+}
+static Value *builtin_mse(int argc, Value **argv) {
+    if (argc != 2 || argv[0]->type != VAL_TENSOR || argv[1]->type != VAL_TENSOR) runtime_error(NULL, "均方误差需要两个张量");
+    Tensor *c = t_mse(argv[0]->tval, argv[1]->tval);
+    if (!c) runtime_error(NULL, "均方误差张量大小不一致");
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
+}
+static Value *builtin_cross_entropy(int argc, Value **argv) {
+    if (argc != 2 || argv[0]->type != VAL_TENSOR || argv[1]->type != VAL_TENSOR) runtime_error(NULL, "交叉熵需要: 概率张量, 标签张量");
+    Tensor *c = t_cross_entropy(argv[0]->tval, argv[1]->tval);
+    if (!c) runtime_error(NULL, "交叉熵概率张量需为二维");
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
+}
+static Value *builtin_cross_entropy_logits(int argc, Value **argv) {
+    if (argc != 2 || argv[0]->type != VAL_TENSOR || argv[1]->type != VAL_TENSOR) runtime_error(NULL, "对数交叉熵需要: 对数张量, 标签张量");
+    Tensor *c = t_cross_entropy_logits(argv[0]->tval, argv[1]->tval);
+    if (!c) runtime_error(NULL, "对数交叉熵对数张量需为二维");
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
+}
+static Value *builtin_backward(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "反向函数需要1个损失张量");
+    tensor_backward(argv[0]->tval);
+    return val_new(VAL_NULL);
+}
+static Value *builtin_optim(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "优化函数需要2个参数: 学习率, 参数列表");
+    double lr = (argv[0]->type == VAL_FLOAT) ? argv[0]->fval : (double)argv[0]->ival;
+    if (argv[1]->type != VAL_LIST) runtime_error(NULL, "优化函数第二个参数必须是参数列表");
+    for (int i = 0; i < argv[1]->list_len; i++) {
+        Value *p = argv[1]->lval[i];
+        if (p->type == VAL_TENSOR && p->tval->requires_grad && p->tval->grad) {
+            Tensor *t = p->tval;
+            for (int j = 0; j < t->size; j++) t->data[j] -= (float)(lr * t->grad[j]);
+            memset(t->grad, 0, t->size * sizeof(float));
+        }
+    }
+    return val_new(VAL_NULL);
+}
+static Value *builtin_get(int argc, Value **argv) {
+    if (argc < 2 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "取函数需要: 张量, 索引...");
+    Tensor *t = argv[0]->tval;
+    int i = (int)argv[1]->ival;
+    if (t->ndim == 2) {
+        int j = (argc >= 3) ? (int)argv[2]->ival : 0;
+        Value *r = val_new(VAL_FLOAT); r->fval = t->data[i * t->shape[1] + j]; return r;
+    }
+    Value *r = val_new(VAL_FLOAT); r->fval = t->data[i]; return r;
+}
+static Value *builtin_set(int argc, Value **argv) {
+    if (argc < 3 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "置函数需要: 张量, 索引, 值");
+    Tensor *t = argv[0]->tval;
+    int i = (int)argv[1]->ival;
+    double v = (argv[argc - 1]->type == VAL_FLOAT) ? argv[argc - 1]->fval : (double)argv[argc - 1]->ival;
+    if (t->ndim == 2 && argc >= 4) { int j = (int)argv[2]->ival; t->data[i * t->shape[1] + j] = (float)v; }
+    else t->data[i] = (float)v;
+    return val_new(VAL_NULL);
+}
+static Value *builtin_requires_grad(int argc, Value **argv) {
+    if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "需梯度函数需要1个张量");
+    argv[0]->tval->requires_grad = 1;
+    Value *r = val_new(VAL_TENSOR); r->tval = tensor_retain(argv[0]->tval); return r;
+}
+
 /* 调用内置函数 */
 static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "长度") == 0) return builtin_len(argc, argv);
@@ -1441,7 +2276,33 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "替换") == 0) return builtin_replace(argc, argv);
     if (strcmp(name, "查找") == 0) return builtin_find(argc, argv);
     if (strcmp(name, "截取") == 0) return builtin_substring(argc, argv);
-    
+    /* 张量 / 模型开发 */
+    if (strcmp(name, "张量") == 0) return builtin_tensor(argc, argv);
+    if (strcmp(name, "全零") == 0) return builtin_zeros(argc, argv);
+    if (strcmp(name, "全一") == 0) return builtin_ones(argc, argv);
+    if (strcmp(name, "随机张量") == 0) return builtin_rand_tensor(argc, argv);
+    if (strcmp(name, "高斯随机") == 0) return builtin_randn(argc, argv);
+    if (strcmp(name, "矩阵乘") == 0) return builtin_matmul(argc, argv);
+    if (strcmp(name, "转置") == 0) return builtin_transpose(argc, argv);
+    if (strcmp(name, "形状") == 0) return builtin_shape(argc, argv);
+    if (strcmp(name, "重塑") == 0) return builtin_reshape(argc, argv);
+    if (strcmp(name, "求和") == 0) return builtin_sum(argc, argv);
+    if (strcmp(name, "均值") == 0) return builtin_mean(argc, argv);
+    if (strcmp(name, "指数") == 0) return builtin_exp(argc, argv);
+    if (strcmp(name, "对数") == 0) return builtin_log(argc, argv);
+    if (strcmp(name, "西格莫德") == 0) return builtin_sigmoid(argc, argv);
+    if (strcmp(name, "双曲正切") == 0) return builtin_tanh(argc, argv);
+    if (strcmp(name, "线性整流") == 0) return builtin_relu(argc, argv);
+    if (strcmp(name, "柔性最大值") == 0) return builtin_softmax(argc, argv);
+    if (strcmp(name, "均方误差") == 0) return builtin_mse(argc, argv);
+    if (strcmp(name, "交叉熵") == 0) return builtin_cross_entropy(argc, argv);
+    if (strcmp(name, "对数交叉熵") == 0) return builtin_cross_entropy_logits(argc, argv);
+    if (strcmp(name, "反向") == 0) return builtin_backward(argc, argv);
+    if (strcmp(name, "优化") == 0) return builtin_optim(argc, argv);
+    if (strcmp(name, "取") == 0) return builtin_get(argc, argv);
+    if (strcmp(name, "置") == 0) return builtin_set(argc, argv);
+    if (strcmp(name, "需梯度") == 0) return builtin_requires_grad(argc, argv);
+
     runtime_error(NULL, "未知内置函数: %s", name);
     return NULL;
 }
@@ -1491,6 +2352,23 @@ static Value *eval_node(Node *n, Env *env) {
                     val_free(l);
                     if (!v) return val_new(VAL_NULL);
                     return val_retain(v);
+                } else if (l->type == VAL_TENSOR) {
+                    int i = (int)idx->ival;
+                    Tensor *T = l->tval;
+                    if (T->ndim == 1) {
+                        if (i < 0 || i >= T->size) runtime_error(n, "张量索引越界");
+                        Value *r = val_new(VAL_FLOAT); r->fval = T->data[i];
+                        val_free(idx); val_free(l); return r;
+                    } else if (T->ndim == 2) {
+                        if (i < 0 || i >= T->shape[0]) runtime_error(n, "张量索引越界");
+                        int cols = T->shape[1];
+                        Tensor *row = tensor_new(1, &cols);
+                        for (int c = 0; c < cols; c++) row->data[c] = T->data[i * cols + c];
+                        Value *r = val_new(VAL_TENSOR); r->tval = row;
+                        val_free(idx); val_free(l); return r;
+                    }
+                    val_free(idx); val_free(l);
+                    runtime_error(n, "不支持的张量维度索引");
                 }
                 val_free(idx); val_free(l);
                 runtime_error(n, "不支持的类型索引");
@@ -1560,25 +2438,14 @@ static Value *eval_node(Node *n, Env *env) {
                 sv->sval = strdup(buf);
                 return sv;
             }
-            /* 张量运算 */
-            if (l->type == VAL_TENSOR || r->type == VAL_TENSOR) {
-                if (l->type != VAL_TENSOR || r->type != VAL_TENSOR) runtime_error(n, "张量操作需要两个张量");
-                Tensor *ta = l->tval, *tb = r->tval;
-                if (ta->ndim != tb->ndim || ta->size != tb->size) runtime_error(n, "张量形状不匹配");
-                Tensor *tc = tensor_new(ta->ndim, ta->shape);
-                if (strcmp(n->binary.op, "+") == 0)
-                    for (int i = 0; i < ta->size; i++) tc->data[i] = ta->data[i] + tb->data[i];
-                else if (strcmp(n->binary.op, "-") == 0)
-                    for (int i = 0; i < ta->size; i++) tc->data[i] = ta->data[i] - tb->data[i];
-                else if (strcmp(n->binary.op, "*") == 0)
-                    for (int i = 0; i < ta->size; i++) tc->data[i] = ta->data[i] * tb->data[i];
-                else if (strcmp(n->binary.op, "/") == 0)
-                    for (int i = 0; i < ta->size; i++) tc->data[i] = ta->data[i] / tb->data[i];
-                else runtime_error(n, "无效的张量运算符");
+            /* 张量运算（支持广播与自动求导） */
+            if (l->type == VAL_TENSOR && r->type == VAL_TENSOR) {
+                Value *tv = tensor_elem_binop(n, n->binary.op, l, r);
                 val_free(l); val_free(r);
-                Value *tv = val_new(VAL_TENSOR);
-                tv->tval = tc;
                 return tv;
+            }
+            if (l->type == VAL_TENSOR || r->type == VAL_TENSOR) {
+                runtime_error(n, "张量运算需要两个张量");
             }
             /* 普通数值 */
             double ld = (l->type == VAL_FLOAT) ? l->fval : l->ival;
@@ -1596,8 +2463,9 @@ static Value *eval_node(Node *n, Env *env) {
             else if (strcmp(n->binary.op, "==") == 0) result = ld == rd;
             else if (strcmp(n->binary.op, "!=") == 0) result = ld != rd;
             else runtime_error(n, "无效的二元运算符: %s", n->binary.op);
+            int is_float = (l->type == VAL_FLOAT || r->type == VAL_FLOAT);
             val_free(l); val_free(r);
-            if (l->type == VAL_FLOAT || r->type == VAL_FLOAT) {
+            if (is_float) {
                 Value *fv = val_new(VAL_FLOAT);
                 fv->fval = result;
                 return fv;
@@ -1773,8 +2641,12 @@ static void exec_node(Node *n, Env *env) {
                 Value *old = env_get(env, n->assign.tgt->ident.name);
                 if (old && old->type == VAL_FUNC) runtime_error(n->assign.tgt, "不能给函数名赋值");
                 env_set(env, n->assign.tgt->ident.name, val);
-            } else if (n->assign.tgt->type == ND_BINARY && 
+            } else if (n->assign.tgt->type == ND_BINARY &&
                        strcmp(n->assign.tgt->binary.op, "[]") == 0) {
+                if (assign_tensor(n->assign.tgt, val, env)) {
+                    val_free(val);
+                    break;
+                }
                 Value *obj = eval_node(n->assign.tgt->binary.left, env);
                 Value *idx = eval_node(n->assign.tgt->binary.right, env);
                 if (obj->type == VAL_LIST) {
@@ -2003,6 +2875,7 @@ int main(int argc, char **argv) {
         val_free(global->values[i]);
     }
     free(global);
+    node_free(prog);
     free(buf);
     return 0;
 }
