@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE            /* pthread_getattr_np：取本线程真实栈区间 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,12 +9,17 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <setjmp.h>
+#include <sys/resource.h>   /* getrlimit：探测真实栈容量 */
 
 /* ========== 基础定义 ========== */
 #define MAX_ID_LEN     128
 #define MAX_PARAMS     32
 #define MAX_LOCALS     512
 #define MAX_DICT_SIZE  256
+/* 单次调用的实参上限：实参数组放在栈上，异常 longjmp 时不会泄漏 */
+#define CO_MAX_ARGS    64
+#define CO_MAX_DIM     8      /* 张量最大维数 */
 
 /* 前向声明 */
 struct Value;
@@ -136,6 +142,121 @@ static Value *val_int(long x);
 static Value *val_flt(double x);
 static Value *val_bool(int b);
 static int    truthy(Value *v);
+/* 前向声明：错误上报与「安全取数」。凡是要把一个 Value 当数字用的地方，
+   必须走 num_of / int_of / dim_of，绝不允许裸读 v->ival / v->fval ——
+   裸读会把字符串指针、列表指针当成整数算，产出「能跑但结果错」的答案。 */
+static void   runtime_error(struct Node *n, const char *msg, ...);
+static void   stack_guard_init(size_t total_bytes);
+static void   stack_guard_check(struct Node *site);
+static const char *val_type_name(Value *v);
+static double num_of(Value *v, const char *who);
+static long   int_of(Value *v, const char *who);
+static int    dim_of(Value *v, const char *who);
+
+/* ========== 异常机制的引用记账（RefLog） ==========
+   语言的 尝试/捕获 基于 setjmp/longjmp 实现。longjmp 会直接丢弃中间
+   C 栈帧，那些帧上"本该执行"的 val_free 全部被跳过 —— 若不管，每次
+   捕获异常都会漏一批临时值（ASan 立刻报泄漏）。
+
+   解决办法是在 try 期间登记每一次【无主的】引用增量，回滚时精确抵消：
+
+     val_new          → +1   新值自带的初始引用
+     val_retain       → +1   临时借用（表达式求值链上的中间引用）
+     val_retain_root  →  —   值被写入容器/环境，引用归容器所有，不登记
+     val_free 未归零  → -1   抵消掉一次已经正常发生的释放
+     val_free 归零    → 抹除该指针在所有帧中的条目（防止回滚时悬空）
+
+   于是回滚只释放"没有任何容器/环境持有的临时引用"，
+   而 try 块内合法写入外层列表/字典/变量的值不会被误杀。 */
+typedef struct RefLog { Value *v; int delta; } RefLog;
+
+#define MAX_TRY_DEPTH 64
+typedef struct TryFrame {
+    jmp_buf  jb;
+    RefLog  *log;
+    int      nlog, caplog;
+    /* longjmp 同样会跳过函数调用的 env_release，作用域本身（含其中变量的
+       引用）也会泄漏。因此 try 期间创建的【函数局部环境】一并登记。 */
+    struct Env **envs;
+    int      nenv, capenv;
+    /* 内建函数里的【裸 malloc 临时缓冲】同样会被 longjmp 跳过 free。
+       例如 排序 的归并临时数组：比较两个不可比类型时会抛错，缓冲就漏了。
+       统一登记，回滚时一并回收。 */
+    void   **bufs;
+    int      nbuf, capbuf;
+    int      recording;    /* 回滚过程中置 0，避免自我干扰 */
+} TryFrame;
+
+/* 与循环控制标志同理：异常状态属于"当前执行流"，必须线程局部，
+   否则并发任务之间会互相抢夺异常载荷。 */
+static __thread TryFrame g_try[MAX_TRY_DEPTH];
+static __thread int      g_try_depth = 0;
+static __thread Value   *g_exc_value = NULL;   /* 正在传播的异常载荷 */
+
+/* 登记一次引用增量。登记到【所有】活跃帧，这样内层 try 期间产生的
+   临时引用在外层 try 捕获时同样可以被回滚（无需帧间合并）。 */
+static void reflog_add(Value *v, int delta) {
+    if (!v || g_try_depth == 0) return;
+    for (int d = 0; d < g_try_depth; d++) {
+        TryFrame *f = &g_try[d];
+        if (!f->recording) continue;
+        if (f->nlog >= f->caplog) {
+            int nc = f->caplog ? f->caplog * 2 : 64;
+            RefLog *nl = realloc(f->log, (size_t)nc * sizeof(RefLog));
+            if (!nl) continue;         /* 内存不足则退化为不记账，绝不崩溃 */
+            f->log = nl; f->caplog = nc;
+        }
+        f->log[f->nlog].v = v;
+        f->log[f->nlog].delta = delta;
+        f->nlog++;
+    }
+}
+
+/* 该值即将被真正 free：把所有帧中指向它的条目打洞，防止回滚访问野指针。
+   （打洞而非压缩数组，O(n) 且不打乱正在进行的遍历。） */
+static void reflog_forget(Value *v) {
+    if (!v || g_try_depth == 0) return;
+    for (int d = 0; d < g_try_depth; d++) {
+        TryFrame *f = &g_try[d];
+        for (int i = 0; i < f->nlog; i++)
+            if (f->log[i].v == v) f->log[i].v = NULL;
+    }
+}
+
+/* 引用交接：把 C 栈上的临时引用【直接】移交给容器槽位
+   （形如 list->lval[i] = eval_node(...)，没有额外 retain）。
+   此后该引用由容器负责释放，不再属于 C 栈，故登记 -1 抵消。
+   漏掉这一步的后果是回滚时把容器里的元素当成无主临时值释放掉 —— 悬空。 */
+static Value *val_adopt(Value *v) {
+    reflog_add(v, -1);
+    return v;
+}
+
+/* 登记一个"其释放会被 longjmp 跳过"的函数局部作用域 */
+static void reflog_track_env(struct Env *e) {
+    if (!e || g_try_depth == 0) return;
+    for (int d = 0; d < g_try_depth; d++) {
+        TryFrame *f = &g_try[d];
+        if (!f->recording) continue;
+        if (f->nenv >= f->capenv) {
+            int nc = f->capenv ? f->capenv * 2 : 16;
+            struct Env **ne = realloc(f->envs, (size_t)nc * sizeof(struct Env*));
+            if (!ne) continue;
+            f->envs = ne; f->capenv = nc;
+        }
+        f->envs[f->nenv++] = e;
+    }
+}
+
+/* 作用域已经正常释放：从所有帧摘除，避免回滚二次释放 */
+static void reflog_untrack_env(struct Env *e) {
+    if (!e || g_try_depth == 0) return;
+    for (int d = 0; d < g_try_depth; d++) {
+        TryFrame *f = &g_try[d];
+        for (int i = 0; i < f->nenv; i++)
+            if (f->envs[i] == e) f->envs[i] = NULL;
+    }
+}
 
 /* ========== 值管理 ========== */
 static Value *val_new(ValType type) {
@@ -145,6 +266,7 @@ static Value *val_new(ValType type) {
     if (type == VAL_MAP) {
         v->mval = calloc(1, sizeof(Map));
     }
+    reflog_add(v, +1);
     return v;
 }
 
@@ -152,7 +274,11 @@ void val_free(Value *v) {
     if (!v) return;
     /* 原子递减：并发任务与主线程可能同时持有同一个值（如全局列表/函数），
        非原子的 refcount-- 会丢失更新，导致提前释放或永久泄漏。 */
-    if (__atomic_sub_fetch(&v->refcount, 1, __ATOMIC_ACQ_REL) > 0) return;
+    if (__atomic_sub_fetch(&v->refcount, 1, __ATOMIC_ACQ_REL) > 0) {
+        reflog_add(v, -1);
+        return;
+    }
+    reflog_forget(v);
     switch (v->type) {
         case VAL_STRING: free(v->sval); break;
         case VAL_LIST:
@@ -195,13 +321,109 @@ void val_free(Value *v) {
 }
 
 static Value *val_retain(Value *v) {
+    if (v) {
+        __atomic_add_fetch(&v->refcount, 1, __ATOMIC_ACQ_REL);
+        reflog_add(v, +1);
+    }
+    return v;
+}
+
+/* 生根 retain：值被写入容器（列表/字典）或环境（变量槽），
+   该引用的生死由容器自己负责，因此【不参与】异常回滚。
+   若误用普通 val_retain，try 块内 追加(外层列表, 值) 的元素
+   会在捕获异常时被错误回收。 */
+static Value *val_retain_root(Value *v) {
     if (v) __atomic_add_fetch(&v->refcount, 1, __ATOMIC_ACQ_REL);
     return v;
 }
 
-/* 下标取值（兼容浮点下标，向零截断） */
+static void env_release(struct Env *e);   /* 前向声明：回滚残留作用域 */
+
+/* ---------- 异常安全的临时缓冲 ----------
+   规则：内建函数中「分配 → 可能报错 → free」的裸内存，必须走这对函数。
+   co_tmp_alloc 会把指针登记到所有活跃 try 帧；正常路径用 co_tmp_free 释放
+   （同时注销登记）；异常路径由 reflog_rollback 统一回收。 */
+static void *co_tmp_alloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) runtime_error(NULL, "内存不足（申请 %zu 字节）", n);
+    for (int d = 0; d < g_try_depth; d++) {
+        TryFrame *f = &g_try[d];
+        if (!f->recording) continue;
+        if (f->nbuf >= f->capbuf) {
+            int nc = f->capbuf ? f->capbuf * 2 : 8;
+            void **nb = realloc(f->bufs, (size_t)nc * sizeof(void*));
+            if (!nb) { free(p); runtime_error(NULL, "内存不足（临时缓冲登记表扩容失败）"); }
+            f->bufs = nb; f->capbuf = nc;
+        }
+        f->bufs[f->nbuf++] = p;
+    }
+    return p;
+}
+static void co_tmp_free(void *p) {
+    if (!p) return;
+    for (int d = 0; d < g_try_depth; d++) {
+        TryFrame *f = &g_try[d];
+        for (int i = 0; i < f->nbuf; i++)
+            if (f->bufs[i] == p) f->bufs[i] = NULL;   /* 打洞，避免二次释放 */
+    }
+    free(p);
+}
+
+/* 逐指针聚合净增量并释放。调用前本帧必须已弹出帧栈且 recording=0。 */
+static void reflog_rollback(TryFrame *f) {
+    /* 顺序很关键：先回收无主的临时引用，再释放残留作用域。
+       反过来会先让作用域里的值归零 free，导致随后的引用回滚访问野指针。
+       （作用域持有的是生根引用，故此刻这些值的 refcount 必 > net，不会误 free。） */
+    for (int i = 0; i < f->nlog; i++) {
+        Value *v = f->log[i].v;
+        if (!v) continue;
+        int net = 0;
+        for (int j = i; j < f->nlog; j++)
+            if (f->log[j].v == v) { net += f->log[j].delta; f->log[j].v = NULL; }
+        /* 真实 refcount ≥ net（可能还有生根引用），故释放 net 次
+           最多恰好归零，不会提前 free 造成二次释放。 */
+        while (net-- > 0) val_free(v);
+    }
+    free(f->log);
+    f->log = NULL; f->nlog = f->caplog = 0;
+
+    /* 被 longjmp 跳过的函数局部作用域，按创建顺序的逆序释放 */
+    for (int i = f->nenv - 1; i >= 0; i--)
+        if (f->envs[i]) env_release(f->envs[i]);
+    free(f->envs);
+    f->envs = NULL; f->nenv = f->capenv = 0;
+
+    /* 被 longjmp 跳过的裸临时缓冲 */
+    for (int i = 0; i < f->nbuf; i++) free(f->bufs[i]);
+    free(f->bufs);
+    f->bufs = NULL; f->nbuf = f->capbuf = 0;
+}
+
+/* 异常载荷及其内部子值必须免于回滚：它要活着交给 捕获 块 */
+static void reflog_protect(Value *v) {
+    if (!v) return;
+    reflog_forget(v);
+    if (v->type == VAL_LIST) {
+        for (int i = 0; i < v->list_len; i++) reflog_protect(v->lval[i]);
+    } else if (v->type == VAL_MAP && v->mval) {
+        for (int i = 0; i < MAX_DICT_SIZE; i++)
+            if (v->mval->entries[i].used) reflog_protect(v->mval->entries[i].val);
+    }
+}
+
+/* 下标取值（兼容浮点下标，向零截断）。
+   必须做类型检查：曾经这里裸读 union，导致 表["键"] 把字符串指针
+   当下标用，越界读出垃圾值甚至崩溃。 */
 static long idx_val(Value *idx) {
-    return (idx->type == VAL_FLOAT) ? (long)idx->fval : idx->ival;
+    if (!idx) runtime_error(NULL, "下标为空");
+    switch (idx->type) {
+        case VAL_INT:   return idx->ival;
+        case VAL_BOOL:  return idx->ival ? 1 : 0;
+        case VAL_FLOAT: return (long)idx->fval;
+        default:
+            runtime_error(NULL, "下标必须是数字");
+            return 0;
+    }
 }
 
 /* ========== UTF-8 字符层 ==========
@@ -421,13 +643,13 @@ static void dict_set(Map *m, const char *key, Value *val) {
         if (m->entries[idx].used && strcmp(m->entries[idx].key, key) == 0) {
             /* 覆盖已有键：复用原 key，只换值（原实现会 strdup 新 key 并泄漏旧 key） */
             Value *old = m->entries[idx].val;
-            m->entries[idx].val = val_retain(val);
+            m->entries[idx].val = val_retain_root(val);
             val_free(old);
             return;
         }
         if (!m->entries[idx].used) {
             m->entries[idx].key = strdup(key);
-            m->entries[idx].val = val_retain(val);
+            m->entries[idx].val = val_retain_root(val);
             m->entries[idx].used = 1;
             m->count++;
             return;
@@ -560,12 +782,21 @@ static void env_mark_shared(Env *e) {
     pthread_mutex_unlock(&g_env_lock);
 }
 
+/* 沿作用域链查找变量。
+   必须用【迭代】而不是递归：作用域链长度等于调用深度，
+   一旦程序递归几千层，递归版的 env_get 单次查找就会吃掉几千个栈帧，
+   在栈守卫来不及介入的地方直接把栈撑爆（曾在 ASan 构建下复现段错误）。 */
 static Value *env_get(Env *e, const char *name) {
-    ENV_LOCK(e);
-    for (int i = 0; i < e->count; i++)
-        if (strcmp(e->names[i], name) == 0) { Value *v = e->values[i]; ENV_UNLOCK(e); return v; }
-    ENV_UNLOCK(e);
-    if (e->parent) return env_get(e->parent, name);
+    for (Env *cur = e; cur; cur = cur->parent) {
+        ENV_LOCK(cur);
+        for (int i = 0; i < cur->count; i++)
+            if (strcmp(cur->names[i], name) == 0) {
+                Value *v = cur->values[i];
+                ENV_UNLOCK(cur);
+                return v;
+            }
+        ENV_UNLOCK(cur);
+    }
     return NULL;
 }
 
@@ -574,14 +805,14 @@ static void env_set(Env *e, const char *name, Value *val) {
     for (int i = 0; i < e->count; i++) {
         if (strcmp(e->names[i], name) == 0) {
             val_free(e->values[i]);
-            e->values[i] = val_retain(val);
+            e->values[i] = val_retain_root(val);
             ENV_UNLOCK(e);
             return;
         }
     }
     if (e->count < MAX_LOCALS) {
         e->names[e->count]  = strdup(name);
-        e->values[e->count] = val_retain(val);
+        e->values[e->count] = val_retain_root(val);
         e->types[e->count]  = NULL;   /* 必须显式置空，否则销毁时 free 野指针 */
         /* count 最后自增并使用 release 语义：确保其他线程看到 count 时，
            对应的 names/values 槽位内容已经写入完毕。 */
@@ -618,12 +849,18 @@ static void env_set_type(Env *e, const char *name, const char *type) {
     }
 }
 
+/* 同上：迭代遍历，不得递归 */
 static const char *env_get_type(Env *e, const char *name) {
-    ENV_LOCK(e);
-    for (int i = 0; i < e->count; i++)
-        if (strcmp(e->names[i], name) == 0) { const char *t = e->types[i]; ENV_UNLOCK(e); return t; }
-    ENV_UNLOCK(e);
-    if (e->parent) return env_get_type(e->parent, name);
+    for (Env *cur = e; cur; cur = cur->parent) {
+        ENV_LOCK(cur);
+        for (int i = 0; i < cur->count; i++)
+            if (strcmp(cur->names[i], name) == 0) {
+                const char *t = cur->types[i];
+                ENV_UNLOCK(cur);
+                return t;
+            }
+        ENV_UNLOCK(cur);
+    }
     return NULL;
 }
 
@@ -645,7 +882,8 @@ typedef enum {
     TK_TYPE_INT, TK_TYPE_FLOAT, TK_TYPE_STRING, TK_TYPE_BOOL,
     TK_TYPE_LIST, TK_TYPE_MAP, TK_TYPE_NULL,
     TK_TYPE_NUM, TK_TYPE_FUNC, TK_TYPE_ANY,
-    TK_CONCUR, TK_WAIT   /* 并发原语：并发 / 等待 */
+    TK_CONCUR, TK_WAIT,  /* 并发原语：并发 / 等待 */
+    TK_TRY, TK_CATCH, TK_FINALLY, TK_THROW  /* 异常：尝试 / 捕获 / 最终 / 抛出 */
 } TokenType;
 
 typedef struct {
@@ -860,6 +1098,10 @@ static void advance() {
         else if (strcmp(cur_tok.text, "任意") == 0) cur_tok.type = TK_TYPE_ANY;
         else if (strcmp(cur_tok.text, "并发") == 0) cur_tok.type = TK_CONCUR;
         else if (strcmp(cur_tok.text, "等待") == 0) cur_tok.type = TK_WAIT;
+        else if (strcmp(cur_tok.text, "尝试") == 0) cur_tok.type = TK_TRY;
+        else if (strcmp(cur_tok.text, "捕获") == 0) cur_tok.type = TK_CATCH;
+        else if (strcmp(cur_tok.text, "最终") == 0) cur_tok.type = TK_FINALLY;
+        else if (strcmp(cur_tok.text, "抛出") == 0) cur_tok.type = TK_THROW;
         else cur_tok.type = TOK_ID;
         return;
     }
@@ -952,7 +1194,8 @@ typedef enum {
     ND_BINARY, ND_UNARY, ND_LITERAL,
     ND_LIST_LIT, ND_MAP_LIT, ND_BREAK, ND_CONTINUE,
     ND_IMPORT, ND_MATCH,  /* 强语言特性：模块导入 / 模式匹配 */
-    ND_CONCUR, ND_WAIT    /* 并发原语：并发 / 等待 */
+    ND_CONCUR, ND_WAIT,   /* 并发原语：并发 / 等待 */
+    ND_TRY, ND_THROW      /* 异常处理：尝试/捕获/最终 与 抛出 */
 } NodeType;
 
 /* else分支结构 */
@@ -997,6 +1240,13 @@ typedef struct Node {
         struct { struct Node *expr; MatchArm *arms; int arm_cnt; } match_stmt;
         struct { struct Node *expr; } concur_stmt;  /* 并发 expr */
         struct { struct Node *expr; } wait_stmt;    /* 等待 expr */
+        /* 尝试 ... 捕获 [变量] ... 最终 ... 结束
+           has_catch/has_finally 区分「只捕获」「只清理」「两者都有」 */
+        struct { struct Node **body;    int bcnt;
+                 struct Node **cbody;   int ccnt;
+                 struct Node **fbody;   int fcnt;
+                 char *var; int has_catch; int has_finally; } try_stmt;
+        struct { struct Node *expr; } throw_stmt;   /* 抛出 expr */
     };
 } Node;
 
@@ -1085,6 +1335,18 @@ static void node_free(Node *n) {
             break;
         case ND_WAIT:
             if (n->wait_stmt.expr) node_free(n->wait_stmt.expr);
+            break;
+        case ND_TRY:
+            for (int i = 0; i < n->try_stmt.bcnt; i++) node_free(n->try_stmt.body[i]);
+            free(n->try_stmt.body);
+            for (int i = 0; i < n->try_stmt.ccnt; i++) node_free(n->try_stmt.cbody[i]);
+            free(n->try_stmt.cbody);
+            for (int i = 0; i < n->try_stmt.fcnt; i++) node_free(n->try_stmt.fbody[i]);
+            free(n->try_stmt.fbody);
+            free(n->try_stmt.var);
+            break;
+        case ND_THROW:
+            if (n->throw_stmt.expr) node_free(n->throw_stmt.expr);
             break;
         case ND_MATCH: {
             if (n->match_stmt.expr) node_free(n->match_stmt.expr);
@@ -1611,6 +1873,58 @@ static Node *parse_while() {
     return n;
 }
 
+/* 收集语句直到遇到给定的三个终止 token 之一（不消费终止符） */
+static Node **parse_block_until(TokenType a, TokenType b, TokenType c, int *out_cnt) {
+    Node **body = NULL; int bcnt = 0, bcap = 0;
+    while (cur_tok.type != a && cur_tok.type != b && cur_tok.type != c &&
+           cur_tok.type != TOK_EOF) {
+        if (cur_tok.type == TOK_NEWLINE) { advance(); continue; }
+        Node *stmt = parse_statement();
+        if (stmt) {
+            if (bcnt >= bcap) { bcap = bcap ? bcap*2 : 4; body = realloc(body, bcap * sizeof(Node*)); }
+            body[bcnt++] = stmt;
+        }
+    }
+    *out_cnt = bcnt;
+    return body;
+}
+
+/* 尝试
+       可能出错的语句
+   捕获 错误            （变量名可省略）
+       补救语句
+   最终                  （可省略）
+       无论如何都要执行的清理
+   结束                                                     */
+static Node *parse_try() {
+    Node *n = make_node(ND_TRY);
+    advance();   /* 吃掉 尝试 */
+    n->try_stmt.body = parse_block_until(TK_CATCH, TK_FINALLY, TK_END, &n->try_stmt.bcnt);
+    n->try_stmt.cbody = NULL; n->try_stmt.ccnt = 0;
+    n->try_stmt.fbody = NULL; n->try_stmt.fcnt = 0;
+    n->try_stmt.var = NULL;
+    n->try_stmt.has_catch = 0; n->try_stmt.has_finally = 0;
+
+    if (cur_tok.type == TK_CATCH) {
+        advance();
+        n->try_stmt.has_catch = 1;
+        if (cur_tok.type == TOK_ID) { n->try_stmt.var = strdup(cur_tok.text); advance(); }
+        n->try_stmt.cbody = parse_block_until(TK_FINALLY, TK_END, TK_END, &n->try_stmt.ccnt);
+    }
+    if (cur_tok.type == TK_FINALLY) {
+        advance();
+        n->try_stmt.has_finally = 1;
+        n->try_stmt.fbody = parse_block_until(TK_END, TK_END, TK_END, &n->try_stmt.fcnt);
+    }
+    if (!n->try_stmt.has_catch && !n->try_stmt.has_finally) {
+        fprintf(stderr, "语法错误 (第%d行,%d列): 尝试 块必须带 捕获 或 最终\n",
+                n->line, n->col);
+        exit(1);
+    }
+    expect(TK_END);
+    return n;
+}
+
 static Node *parse_for() {
     advance();
     if (type_token_name(cur_tok.type)) advance(); /* 可选类型标注：对于 整数 i 从 ... */
@@ -1782,6 +2096,13 @@ static Node *parse_statement() {
     if (cur_tok.type == TK_FUNC) return parse_func_def();
     if (cur_tok.type == TK_IMPORT) return parse_import();
     if (cur_tok.type == TK_MATCH) return parse_match();
+    if (cur_tok.type == TK_TRY) return parse_try();
+    if (cur_tok.type == TK_THROW) {
+        Node *n = make_node(ND_THROW);
+        advance();
+        n->throw_stmt.expr = parse_expression();
+        return n;
+    }
     if (cur_tok.type == TK_RETURN) {
         advance();
         Node *n = make_node(ND_RETURN);
@@ -1817,18 +2138,73 @@ static Node *parse_program() {
     return prog;
 }
 
+/* ========== 异常抛出 ==========
+   错误载荷统一是一个字典 {类型, 消息, 行, 列}，
+   于是 捕获 块里不论捕到哪种错误，都能用 错误["消息"] 拿到说明。 */
+static Value *make_error_value(const char *kind, const char *msg, int line, int col) {
+    Value *e = val_new(VAL_MAP);
+    Value *k = val_new(VAL_STRING); k->sval = strdup(kind);
+    Value *m = val_new(VAL_STRING); m->sval = strdup(msg);
+    Value *l = val_int(line);
+    Value *c = val_int(col);
+    dict_set(e->mval, "类型", k);
+    dict_set(e->mval, "消息", m);
+    dict_set(e->mval, "行",   l);
+    dict_set(e->mval, "列",   c);
+    val_free(k); val_free(m); val_free(l); val_free(c);
+    return e;
+}
+
+/* 取错误字典里的字段（缺失时给出兜底），用于无人捕获时打印诊断 */
+static const char *err_field_str(Value *e, const char *key, const char *dflt) {
+    if (!e || e->type != VAL_MAP) return dflt;
+    Value *v = dict_get(e->mval, key);
+    return (v && v->type == VAL_STRING && v->sval) ? v->sval : dflt;
+}
+static long err_field_int(Value *e, const char *key) {
+    if (!e || e->type != VAL_MAP) return 0;
+    Value *v = dict_get(e->mval, key);
+    return (v && v->type == VAL_INT) ? v->ival : 0;
+}
+
+/* 无人捕获：打印诊断并退出（保持与原来完全一致的错误输出格式） */
+static void die_uncaught(Value *err) {
+    const char *kind = err_field_str(err, "类型", "运行时错误");
+    const char *msg  = err_field_str(err, "消息", "未知错误");
+    long line = err_field_int(err, "行"), col = err_field_int(err, "列");
+    if (line > 0) fprintf(stderr, "%s (第%ld行,%ld列): %s\n", kind, line, col, msg);
+    else          fprintf(stderr, "%s: %s\n", kind, msg);
+    exit(1);
+}
+
+/* 跳转到最近的 尝试 帧：先保住载荷，再回滚该帧期间的临时引用与作用域 */
+static void throw_to_frame(Value *err) {
+    reflog_protect(err);          /* 载荷及其子值免于回滚 */
+    g_exc_value = err;
+    g_try_depth--;
+    TryFrame *f = &g_try[g_try_depth];
+    f->recording = 0;
+    reflog_rollback(f);
+    longjmp(f->jb, 1);
+}
+
 /* ========== 解释器 ========== */
+/* 运行时错误：若身处 尝试 块内则转为可捕获的异常，否则按老规矩致命退出。
+   如此一来全部 200 余处 runtime_error 调用点无需任何改动，
+   语言里每一种运行时错误都自动变得可以被 捕获。 */
 static void runtime_error(Node *n, const char *msg, ...) {
+    char buf[1024];
     va_list args;
     va_start(args, msg);
-    if (n) {
-        fprintf(stderr, "运行时错误 (第%d行,%d列): ", n->line, n->col);
-    } else {
-        fprintf(stderr, "运行时错误: ");
-    }
-    vfprintf(stderr, msg, args);
-    fprintf(stderr, "\n");
+    vsnprintf(buf, sizeof(buf), msg, args);
     va_end(args);
+
+    if (g_try_depth > 0) {
+        throw_to_frame(make_error_value("运行时错误", buf,
+                                        n ? n->line : 0, n ? n->col : 0));
+    }
+    if (n) fprintf(stderr, "运行时错误 (第%d行,%d列): %s\n", n->line, n->col, buf);
+    else   fprintf(stderr, "运行时错误: %s\n", buf);
     exit(1);
 }
 
@@ -1957,7 +2333,9 @@ static Value *builtin_sqrt(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "平方根函数需要1个参数");
     Value *v = argv[0];
     Value *r = val_new(VAL_FLOAT);
-    r->fval = sqrt((v->type == VAL_FLOAT) ? v->fval : v->ival);
+    double x = num_of(v, "平方根函数");
+    if (x < 0) runtime_error(NULL, "平方根函数不接受负数：%g", x);
+    r->fval = sqrt(x);
     return r;
 }
 
@@ -1980,12 +2358,31 @@ static Value *builtin_now(int argc, Value **argv) {
 
 /* 数值取出（整数/浮点/布尔统一为 double），非数字报错 */
 static double num_of(Value *v, const char *who) {
+    if (!v) runtime_error(NULL, "%s 收到空值", who);
     if (v->type == VAL_INT)   return (double)v->ival;
     if (v->type == VAL_FLOAT) return v->fval;
     if (v->type == VAL_BOOL)  return v->ival ? 1.0 : 0.0;  /* 真=1 假=0，允许参与算术 */
-    runtime_error(NULL, "%s 需要数字参数，收到 %s", who,
-                  v->type == VAL_STRING ? "字符串" : "非数字");
+    runtime_error(NULL, "%s 需要数字参数，收到 %s", who, val_type_name(v));
     return 0;
+}
+
+/* 取整数（向零截断）。用于下标、次数、维度之外的整数场合。 */
+static long int_of(Value *v, const char *who) {
+    double d = num_of(v, who);
+    if (d != d) runtime_error(NULL, "%s 收到非法数字 (NaN)", who);
+    if (d > 9.2e18 || d < -9.2e18) runtime_error(NULL, "%s 的整数值超出范围", who);
+    return (long)d;
+}
+
+/* 取「维度」：必须是正整数且不得大到能撑爆内存。
+   曾经这里直接 (int)v->ival，张量([0]) 会 calloc(0)、张量([-3]) 会
+   calloc 一个巨大无符号数，属于典型的内存安全漏洞。 */
+#define CO_MAX_DIM_SIZE 100000000L   /* 单维长度上限 1 亿，防止形状溢出 */
+static int dim_of(Value *v, const char *who) {
+    long d = int_of(v, who);
+    if (d <= 0)          runtime_error(NULL, "%s 的维度必须是正整数，收到 %ld", who, d);
+    if (d > CO_MAX_DIM_SIZE) runtime_error(NULL, "%s 的维度过大：%ld（上限 %ld）", who, d, CO_MAX_DIM_SIZE);
+    return (int)d;
 }
 
 /* 真值判断（唯一权威实现，所有条件/逻辑运算都必须走这里）：
@@ -2111,7 +2508,7 @@ static Value *builtin_append(int argc, Value **argv) {
     Value *item = argv[1];
     Value **new_list = realloc(list->lval, (list->list_len + 1) * sizeof(Value*));
     list->lval = new_list;
-    list->lval[list->list_len] = val_retain(item);
+    list->lval[list->list_len] = val_retain_root(item);
     list->list_len++;
     return val_retain(list);   /* 返回列表本身：既保留原地语义，又支持链式调用 */
 }
@@ -2222,10 +2619,10 @@ static Value *builtin_sort(int argc, Value **argv) {
     int desc = 0;
     if (argc == 2) desc = truthy(argv[1]);
     if (list->list_len > 1) {
-        Value **tmp = malloc(list->list_len * sizeof(Value*));
-        if (!tmp) runtime_error(NULL, "排序时内存不足");
+        /* 比较过程可能抛错（如列表里混有不可比类型），必须用异常安全缓冲 */
+        Value **tmp = co_tmp_alloc((size_t)list->list_len * sizeof(Value*));
         val_msort(list->lval, tmp, 0, list->list_len, desc);
-        free(tmp);
+        co_tmp_free(tmp);
     }
     return val_retain(list);
 }
@@ -2242,7 +2639,7 @@ static void list_push(Value *list, Value *item /* 借用，内部 retain */) {
     Value **nl = realloc(list->lval, (list->list_len + 1) * sizeof(Value*));
     if (!nl) runtime_error(NULL, "列表扩容时内存不足");
     list->lval = nl;
-    list->lval[list->list_len++] = val_retain(item);
+    list->lval[list->list_len++] = val_retain_root(item);
 }
 
 /* 范围(n) -> [0..n-1]；范围(a,b) -> [a..b-1]；范围(a,b,步长) */
@@ -2308,7 +2705,7 @@ static Value *builtin_insert(int argc, Value **argv) {
     if (!nl) runtime_error(NULL, "插入时内存不足");
     l->lval = nl;
     for (long i = l->list_len; i > idx; i--) l->lval[i] = l->lval[i-1];
-    l->lval[idx] = val_retain(argv[2]);
+    l->lval[idx] = val_retain_root(argv[2]);
     l->list_len++;
     return val_retain(l);
 }
@@ -2852,7 +3249,6 @@ static Value *builtin_read_lines(int argc, Value **argv) {
 }
 
 /* ========== 自动求导 / 张量算子 ========== */
-#define CO_MAX_DIM 8
 
 /* 广播形状计算（numpy 风格，末尾对齐）；失败返回 -1 */
 static int bc_shape(const int *a, int na, const int *b, int nb, int *out) {
@@ -3279,7 +3675,7 @@ static int assign_tensor(Node *tgt, Value *val, Env *env) {
             int r = (int)i1->ival, c = (int)i2->ival;
             int cols = base->tval->shape[1];
             if (r < 0 || r >= base->tval->shape[0] || c < 0 || c >= cols) runtime_error(tgt, "张量索引越界");
-            double v = (val->type == VAL_FLOAT) ? val->fval : (val->type == VAL_INT ? val->ival : 0);
+            double v = num_of(val, "张量元素赋值");
             base->tval->data[r * cols + c] = (float)v;
             val_free(i1); val_free(i2);
             return 1;
@@ -3293,7 +3689,7 @@ static int assign_tensor(Node *tgt, Value *val, Env *env) {
         if (base && base->type == VAL_TENSOR && base->tval->ndim == 1) {
             int i = (int)idx_val(idx);
             if (i < 0 || i >= base->tval->size) runtime_error(tgt, "张量索引越界");
-            double v = (val->type == VAL_FLOAT) ? val->fval : (val->type == VAL_INT ? val->ival : 0);
+            double v = num_of(val, "张量元素赋值");
             base->tval->data[i] = (float)v;
             val_free(idx);
             return 1;
@@ -3366,35 +3762,45 @@ static Value *builtin_tensor(int argc, Value **argv) {
 
 static Value *builtin_zeros(int argc, Value **argv) {
     if (argc != 1 || argv[0]->type != VAL_LIST) runtime_error(NULL, "全零函数需要形状列表");
-    int ndim = argv[0]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
-    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[0]->lval[i]->ival; size *= sh[i]; }
+    int ndim = argv[0]->list_len;
+    if (ndim < 1 || ndim > CO_MAX_DIM) runtime_error(NULL, "形状维数必须在 1..%d 之间，收到 %d", CO_MAX_DIM, ndim);
+    int sh[CO_MAX_DIM]; int size = 1;   /* 栈数组：异常 longjmp 时不会漏 */
+    for (int i = 0; i < ndim; i++) { sh[i] = dim_of(argv[0]->lval[i], "形状列表"); size *= sh[i]; }
     Tensor *c = tensor_new(ndim, sh);
-    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
 }
 static Value *builtin_ones(int argc, Value **argv) {
     if (argc != 1 || argv[0]->type != VAL_LIST) runtime_error(NULL, "全一函数需要形状列表");
-    int ndim = argv[0]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
-    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[0]->lval[i]->ival; size *= sh[i]; }
+    int ndim = argv[0]->list_len;
+    if (ndim < 1 || ndim > CO_MAX_DIM) runtime_error(NULL, "形状维数必须在 1..%d 之间，收到 %d", CO_MAX_DIM, ndim);
+    int sh[CO_MAX_DIM]; int size = 1;   /* 栈数组：异常 longjmp 时不会漏 */
+    for (int i = 0; i < ndim; i++) { sh[i] = dim_of(argv[0]->lval[i], "形状列表"); size *= sh[i]; }
     Tensor *c = tensor_new(ndim, sh);
     for (int i = 0; i < size; i++) c->data[i] = 1.0f;
-    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
 }
 static Value *builtin_rand_tensor(int argc, Value **argv) {
     if (argc != 3 || argv[0]->type != VAL_LIST) runtime_error(NULL, "随机张量需要: 形状列表, 下限, 上限");
-    int ndim = argv[0]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
-    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[0]->lval[i]->ival; size *= sh[i]; }
-    double lo = (argv[1]->type == VAL_FLOAT) ? argv[1]->fval : (double)argv[1]->ival;
-    double hi = (argv[2]->type == VAL_FLOAT) ? argv[2]->fval : (double)argv[2]->ival;
+    int ndim = argv[0]->list_len;
+    if (ndim < 1 || ndim > CO_MAX_DIM) runtime_error(NULL, "形状维数必须在 1..%d 之间，收到 %d", CO_MAX_DIM, ndim);
+    int sh[CO_MAX_DIM]; int size = 1;   /* 栈数组：异常 longjmp 时不会漏 */
+    for (int i = 0; i < ndim; i++) { sh[i] = dim_of(argv[0]->lval[i], "形状列表"); size *= sh[i]; }
+    double lo = num_of(argv[1], "随机张量的下限");
+    double hi = num_of(argv[2], "随机张量的上限");
+    if (lo > hi) runtime_error(NULL, "随机张量的下限不能大于上限");
     Tensor *c = tensor_new(ndim, sh);
     for (int i = 0; i < size; i++) c->data[i] = (float)(lo + (double)rand() / RAND_MAX * (hi - lo));
-    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
 }
 static Value *builtin_randn(int argc, Value **argv) {
     if (argc != 3 || argv[0]->type != VAL_LIST) runtime_error(NULL, "高斯随机需要: 形状列表, 均值, 标准差");
-    int ndim = argv[0]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
-    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[0]->lval[i]->ival; size *= sh[i]; }
-    double mean = (argv[1]->type == VAL_FLOAT) ? argv[1]->fval : (double)argv[1]->ival;
-    double std = (argv[2]->type == VAL_FLOAT) ? argv[2]->fval : (double)argv[2]->ival;
+    int ndim = argv[0]->list_len;
+    if (ndim < 1 || ndim > CO_MAX_DIM) runtime_error(NULL, "形状维数必须在 1..%d 之间，收到 %d", CO_MAX_DIM, ndim);
+    int sh[CO_MAX_DIM]; int size = 1;   /* 栈数组：异常 longjmp 时不会漏 */
+    for (int i = 0; i < ndim; i++) { sh[i] = dim_of(argv[0]->lval[i], "形状列表"); size *= sh[i]; }
+    double mean = num_of(argv[1], "高斯随机的均值");
+    double std  = num_of(argv[2], "高斯随机的标准差");
+    if (std < 0) runtime_error(NULL, "高斯随机的标准差不能为负");
     Tensor *c = tensor_new(ndim, sh);
     for (int i = 0; i < size; i++) {
         double u1 = ((double)rand() + 1) / ((double)RAND_MAX + 1);
@@ -3402,7 +3808,7 @@ static Value *builtin_randn(int argc, Value **argv) {
         double z = sqrt(-2 * log(u1)) * cos(2 * 3.14159265358979323846 * u2);
         c->data[i] = (float)(mean + std * z);
     }
-    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
 }
 static Value *builtin_matmul(int argc, Value **argv) {
     if (argc != 2 || argv[0]->type != VAL_TENSOR || argv[1]->type != VAL_TENSOR) runtime_error(NULL, "矩阵乘需要两个张量");
@@ -3420,18 +3826,20 @@ static Value *builtin_shape(int argc, Value **argv) {
     if (argc != 1 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "形状函数需要1个张量");
     Tensor *t = argv[0]->tval;
     Value *r = val_new(VAL_LIST); r->list_len = t->ndim; r->lval = malloc(t->ndim * sizeof(Value*));
-    for (int i = 0; i < t->ndim; i++) { Value *e = val_new(VAL_INT); e->ival = t->shape[i]; r->lval[i] = e; }
+    for (int i = 0; i < t->ndim; i++) { Value *e = val_new(VAL_INT); e->ival = t->shape[i]; r->lval[i] = val_adopt(e); }
     return r;
 }
 static Value *builtin_reshape(int argc, Value **argv) {
     if (argc != 2 || argv[0]->type != VAL_TENSOR || argv[1]->type != VAL_LIST) runtime_error(NULL, "重塑函数需要: 张量, 形状列表");
     Tensor *t = argv[0]->tval;
-    int ndim = argv[1]->list_len; int *sh = malloc(ndim * sizeof(int)); int size = 1;
-    for (int i = 0; i < ndim; i++) { sh[i] = (int)argv[1]->lval[i]->ival; size *= sh[i]; }
+    int ndim = argv[1]->list_len;
+    if (ndim < 1 || ndim > CO_MAX_DIM) runtime_error(NULL, "形状维数必须在 1..%d 之间，收到 %d", CO_MAX_DIM, ndim);
+    int sh[CO_MAX_DIM]; int size = 1;   /* 栈数组：异常 longjmp 时不会漏 */
+    for (int i = 0; i < ndim; i++) { sh[i] = dim_of(argv[1]->lval[i], "形状列表"); size *= sh[i]; }
     if (size != t->size) runtime_error(NULL, "重塑前后元素总数不一致");
     Tensor *c = tensor_new(ndim, sh);
     memcpy(c->data, t->data, t->size * sizeof(float));
-    Value *r = val_new(VAL_TENSOR); r->tval = c; free(sh); return r;
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
 }
 /* 求和：张量 -> 标量张量；列表 -> 数值（多态，与 累加 等价） */
 static Value *builtin_sum(int argc, Value **argv) {
@@ -3501,7 +3909,7 @@ static Value *builtin_backward(int argc, Value **argv) {
 }
 static Value *builtin_optim(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "优化函数需要2个参数: 学习率, 参数列表");
-    double lr = (argv[0]->type == VAL_FLOAT) ? argv[0]->fval : (double)argv[0]->ival;
+    double lr = num_of(argv[0], "优化函数的学习率");
     if (argv[1]->type != VAL_LIST) runtime_error(NULL, "优化函数第二个参数必须是参数列表");
     for (int i = 0; i < argv[1]->list_len; i++) {
         Value *p = argv[1]->lval[i];
@@ -3513,23 +3921,41 @@ static Value *builtin_optim(int argc, Value **argv) {
     }
     return val_new(VAL_NULL);
 }
+/* 张量索引 + 越界检查。
+   原先 取/置 直接用 t->data[i] 而不检查 i，负索引或超界会
+   越界读写堆内存——是可被利用的内存安全漏洞，不只是"结果错"。 */
+static int tensor_linear(Tensor *t, Value *iv, const char *who) {
+    long i = int_of(iv, who);
+    if (i < 0) i += t->size;                       /* 支持负索引 */
+    if (i < 0 || i >= t->size)
+        runtime_error(NULL, "%s 的索引越界：%ld（共 %d 个元素）", who, i, t->size);
+    return (int)i;
+}
+static int tensor_offset_2d(Tensor *t, Value *rv, Value *cv, const char *who) {
+    long rows = t->shape[0], cols = t->shape[1];
+    long i = int_of(rv, who);
+    long j = cv ? int_of(cv, who) : 0;
+    if (i < 0) i += rows;
+    if (j < 0) j += cols;
+    if (i < 0 || i >= rows) runtime_error(NULL, "%s 的行索引越界：%ld（共 %ld 行）", who, i, rows);
+    if (j < 0 || j >= cols) runtime_error(NULL, "%s 的列索引越界：%ld（共 %ld 列）", who, j, cols);
+    return (int)(i * cols + j);
+}
 static Value *builtin_get(int argc, Value **argv) {
     if (argc < 2 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "取函数需要: 张量, 索引...");
     Tensor *t = argv[0]->tval;
-    int i = (int)argv[1]->ival;
-    if (t->ndim == 2) {
-        int j = (argc >= 3) ? (int)argv[2]->ival : 0;
-        Value *r = val_new(VAL_FLOAT); r->fval = t->data[i * t->shape[1] + j]; return r;
-    }
-    Value *r = val_new(VAL_FLOAT); r->fval = t->data[i]; return r;
+    int off = (t->ndim == 2) ? tensor_offset_2d(t, argv[1], (argc >= 3) ? argv[2] : NULL, "取函数")
+                             : tensor_linear(t, argv[1], "取函数");
+    Value *r = val_new(VAL_FLOAT); r->fval = t->data[off]; return r;
 }
 static Value *builtin_set(int argc, Value **argv) {
     if (argc < 3 || argv[0]->type != VAL_TENSOR) runtime_error(NULL, "置函数需要: 张量, 索引, 值");
     Tensor *t = argv[0]->tval;
-    int i = (int)argv[1]->ival;
-    double v = (argv[argc - 1]->type == VAL_FLOAT) ? argv[argc - 1]->fval : (double)argv[argc - 1]->ival;
-    if (t->ndim == 2 && argc >= 4) { int j = (int)argv[2]->ival; t->data[i * t->shape[1] + j] = (float)v; }
-    else t->data[i] = (float)v;
+    double v = num_of(argv[argc - 1], "置函数的值");
+    /* 置(张量, 行, 列, 值) 走二维定位；置(张量, i, 值) 走线性偏移 */
+    int off = (t->ndim == 2 && argc >= 4) ? tensor_offset_2d(t, argv[1], argv[2], "置函数")
+                                          : tensor_linear(t, argv[1], "置函数");
+    t->data[off] = (float)v;
     return val_new(VAL_NULL);
 }
 static Value *builtin_requires_grad(int argc, Value **argv) {
@@ -3729,6 +4155,9 @@ static __thread const char *g_cur_ret_type = NULL;
 /* ========== 并发原语（并发 spawn / 等待 join） ========== */
 static void *task_worker(void *p) {
     Task *t = (Task*)p;
+    /* 栈守卫是线程局部的：每个任务线程必须自己立基准，
+       否则 g_stack_base 为 NULL，该线程内的无限递归将直接爆栈。 */
+    stack_guard_init(0);
     /* 控制流标志是线程局部的，此处天然从干净状态开始 */
     t->result = eval_node(t->node, t->env);
     /* 释放任务隔离环境（返回值已独立持有引用，不依赖环境） */
@@ -3768,6 +4197,7 @@ static void hoist_functions(Node *prog, Env *env) {
 /* 释放一个调用/任务环境（其中的名字、类型标注、值均由该环境持有） */
 static void env_release(Env *e) {
     if (!e) return;
+    reflog_untrack_env(e);   /* 正常释放：从异常回滚名单里摘除 */
     for (int i = 0; i < e->count; i++) {
         free(e->names[i]);
         if (e->types[i]) free(e->types[i]);
@@ -3776,9 +4206,56 @@ static void env_release(Env *e) {
     free(e);
 }
 
-/* 递归深度上限：把「无限递归 -> 段错误」变成一条清晰的运行时错误 */
-#define CO_MAX_CALL_DEPTH 3000
+/* ========== 栈守卫 ==========
+   原先仅用「固定 3000 层调用深度」防无限递归，这不安全：
+   - 栈帧大小随编译选项浮动：净化器构建下帧大数倍，3000 层就已真的爆栈；
+   - 并发任务线程的栈通常远小于主线程；
+   - 深度嵌套的表达式同样吃栈，却完全不计入「调用层数」。
+
+   实现要点（两次踩坑换来的）：
+   1) 判定必须用 __builtin_frame_address(0)，不能用「局部变量取地址」——
+      ASan 会把取地址的局部变量搬到堆上的 fake stack，量出来的"栈用量"
+      会忽大忽小甚至倒退，守卫形同失效。
+   2) 栈区间要问 pthread_getattr_np 拿真值，而不是拿 RLIMIT_STACK 猜；
+      线程栈和进程栈上限常常并不一致。
+   3) 检查点要覆盖全部递归热点：invoke_func / eval_node / exec_node。
+   目标：无限递归得到一条中文诊断（还能被 尝试/捕获 接住），而不是 SIGSEGV。 */
+static __thread char *g_stack_redline = NULL;   /* 帧地址触到这里即判定「快见底」 */
+
+static void stack_guard_init(size_t hint) {
+    void  *lo = NULL;
+    size_t sz = 0;
+    pthread_attr_t at;
+    if (pthread_getattr_np(pthread_self(), &at) == 0) {
+        if (pthread_attr_getstack(&at, &lo, &sz) != 0) { lo = NULL; sz = 0; }
+        pthread_attr_destroy(&at);
+    }
+    if (lo && sz > (1u << 20)) {
+        /* lo 是栈的最低可用地址，栈自 lo+sz 向低地址生长。
+           预留 1/8（至少 1 MB）：报错路径本身也要栈。 */
+        size_t reserve = sz / 8;
+        if (reserve < (1u << 20)) reserve = 1u << 20;
+        g_stack_redline = (char *)lo + reserve;
+    } else {
+        /* 退化路径：以当前帧为基准，按 RLIMIT_STACK 估算可用额度 */
+        size_t total = hint ? hint : (8u << 20);
+        struct rlimit rl;
+        if (!hint && getrlimit(RLIMIT_STACK, &rl) == 0 &&
+            rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > (1u << 20))
+            total = (size_t)rl.rlim_cur;
+        g_stack_redline = (char *)__builtin_frame_address(0) - (total - total / 4);
+    }
+}
+
+/* 递归深度上限：仅作为「明显失控」的第二道防线，真正把关的是栈红线。
+   有了栈守卫，这个值可以放得很高，让合法的深递归（如深树遍历）跑得通。 */
+#define CO_MAX_CALL_DEPTH 200000
 static __thread int g_call_depth = 0;
+
+static void stack_guard_check(struct Node *site) {
+    if (g_stack_redline && (char *)__builtin_frame_address(0) <= g_stack_redline)
+        runtime_error(site, "调用栈即将耗尽（剩余栈空间不足预留量），请检查是否存在无限递归");
+}
 
 /* 统一的用户函数调用入口
    —— 原先有两条重复实现，其中表达式调用那条不支持 g_return_flag，
@@ -3790,6 +4267,8 @@ static Value *invoke_func(Func *fn, Value **args, int argc, Node *site, Env *env
     if (fn->param_count != argc)
         runtime_error(site, "函数 %s 参数数量错误: 期望 %d, 得到 %d",
                       fn->name ? fn->name : "匿名", fn->param_count, argc);
+    /* 双重保护：真实栈余量（主）+ 层数上限（兜底，防计数溢出） */
+    stack_guard_check(site);
     if (++g_call_depth > CO_MAX_CALL_DEPTH) {
         g_call_depth--;
         runtime_error(site, "递归过深（超过 %d 层），请检查是否存在无限递归", CO_MAX_CALL_DEPTH);
@@ -3798,6 +4277,9 @@ static Value *invoke_func(Func *fn, Value **args, int argc, Node *site, Env *env
         if (fn->ptypes && fn->ptypes[i]) ensure_type(fn->ptypes[i], args[i], site, "函数参数");
 
     Env *call_env = env_new(env);
+    /* 若外层有 尝试 块，函数体内抛出的异常会 longjmp 越过下面的
+       env_release —— 登记后由回滚统一释放，杜绝作用域泄漏。 */
+    reflog_track_env(call_env);
     for (int i = 0; i < argc; i++) {
         env_set(call_env, fn->params[i], args[i]);   /* env_set 内部 retain，实参仍由调用方释放 */
         if (fn->ptypes && fn->ptypes[i]) env_set_type(call_env, fn->params[i], fn->ptypes[i]);
@@ -3836,6 +4318,7 @@ static Value *call_fn_value(Value *fnval, Value **args, int argc) {
 }
 
 static Value *eval_node(Node *n, Env *env) {
+    stack_guard_check(n);   /* 表达式递归同样吃栈，必须设卡 */
     if (!n) return val_new(VAL_NULL);
     switch (n->type) {
         case ND_LITERAL: {
@@ -4086,7 +4569,7 @@ static Value *eval_node(Node *n, Env *env) {
                         if (take) {
                             Value *item = eval_node(n->list_lit.elements[0], env);
                             result->lval = realloc(result->lval, (result->list_len+1)*sizeof(Value*));
-                            result->lval[result->list_len++] = item;
+                            result->lval[result->list_len++] = val_adopt(item);
                         }
                     }
                 } else if (src->type == VAL_STRING) {
@@ -4104,7 +4587,7 @@ static Value *eval_node(Node *n, Env *env) {
                         if (take) {
                             Value *item = eval_node(n->list_lit.elements[0], env);
                             result->lval = realloc(result->lval, (result->list_len+1)*sizeof(Value*));
-                            result->lval[result->list_len++] = item;
+                            result->lval[result->list_len++] = val_adopt(item);
                         }
                     }
                 } else if (src->type == VAL_MAP) {
@@ -4120,7 +4603,7 @@ static Value *eval_node(Node *n, Env *env) {
                         if (take) {
                             Value *item = eval_node(n->list_lit.elements[0], env);
                             result->lval = realloc(result->lval, (result->list_len+1)*sizeof(Value*));
-                            result->lval[result->list_len++] = item;
+                            result->lval[result->list_len++] = val_adopt(item);
                         }
                     }
                 } else {
@@ -4133,7 +4616,7 @@ static Value *eval_node(Node *n, Env *env) {
             list->list_len = n->list_lit.ecnt;
             list->lval = malloc(list->list_len * sizeof(Value*));
             for (int i = 0; i < n->list_lit.ecnt; i++) {
-                list->lval[i] = eval_node(n->list_lit.elements[i], env);
+                list->lval[i] = val_adopt(eval_node(n->list_lit.elements[i], env));
             }
             return list;
         }
@@ -4265,16 +4748,21 @@ static Value *eval_node(Node *n, Env *env) {
                 Value *fnval = env_get(env, n->func_call.callee->ident.name);
                 if (fnval && fnval->type == VAL_FUNC) {
                     /* fnval 来自 env_get，不额外 retain，不能 free */
-                    Value **args = malloc(n->func_call.acnt * sizeof(Value*));
+                    /* 实参数组用【栈】数组：原先是 malloc，一旦函数体内抛出异常，
+                       longjmp 会跳过 free(args) 造成泄漏。栈数组随栈自动消失。 */
+                    if (n->func_call.acnt > CO_MAX_ARGS)
+                        runtime_error(n, "实参个数超过上限 %d", CO_MAX_ARGS);
+                    Value *args[CO_MAX_ARGS];
                     for (int i = 0; i < n->func_call.acnt; i++)
                         args[i] = eval_node(n->func_call.args[i], env);
                     Value *ret = invoke_func(fnval->fnval, args, n->func_call.acnt, n, env);
                     for (int i = 0; i < n->func_call.acnt; i++) val_free(args[i]);
-                    free(args);
                     return ret;
                 }
                 /* 不是用户函数，尝试内置函数 */
-                Value **args = malloc(n->func_call.acnt * sizeof(Value*));
+                if (n->func_call.acnt > CO_MAX_ARGS)
+                    runtime_error(n, "实参个数超过上限 %d", CO_MAX_ARGS);
+                Value *args[CO_MAX_ARGS];
                 for (int i = 0; i < n->func_call.acnt; i++) {
                     args[i] = eval_node(n->func_call.args[i], env);
                 }
@@ -4282,18 +4770,20 @@ static Value *eval_node(Node *n, Env *env) {
                 for (int i = 0; i < n->func_call.acnt; i++) {
                     val_free(args[i]);
                 }
-                free(args);
                 return result;
             }
             /* 被调用方是表达式（如列表/字典里取出的函数值） */
             Value *fnval = eval_node(n->func_call.callee, env);
-            if (fnval->type != VAL_FUNC) runtime_error(n, "值不是一个函数");
-            Value **args = malloc(n->func_call.acnt * sizeof(Value*));
+            if (fnval->type != VAL_FUNC) { val_free(fnval); runtime_error(n, "值不是一个函数"); }
+            if (n->func_call.acnt > CO_MAX_ARGS) {
+                val_free(fnval);
+                runtime_error(n, "实参个数超过上限 %d", CO_MAX_ARGS);
+            }
+            Value *cargs[CO_MAX_ARGS];
             for (int i = 0; i < n->func_call.acnt; i++)
-                args[i] = eval_node(n->func_call.args[i], env);
-            Value *ret = invoke_func(fnval->fnval, args, n->func_call.acnt, n, env);
-            for (int i = 0; i < n->func_call.acnt; i++) val_free(args[i]);
-            free(args);
+                cargs[i] = eval_node(n->func_call.args[i], env);
+            Value *ret = invoke_func(fnval->fnval, cargs, n->func_call.acnt, n, env);
+            for (int i = 0; i < n->func_call.acnt; i++) val_free(cargs[i]);
             val_free(fnval);
             return ret;
         }
@@ -4305,6 +4795,7 @@ static Value *eval_node(Node *n, Env *env) {
 
 /* 执行语句 */
 static void exec_node(Node *n, Env *env) {
+    stack_guard_check(n);   /* 语句递归同样吃栈，必须设卡 */
     if (!n) return;
     if (g_return_flag) return;
     if (loop_ctx && loop_ctx->should_break) return;
@@ -4350,7 +4841,7 @@ static void exec_node(Node *n, Env *env) {
                         obj->list_len = i+1;
                     }
                     val_free(obj->lval[i]);
-                    obj->lval[i] = val_retain(val);
+                    obj->lval[i] = val_retain_root(val);
                 } else if (obj->type == VAL_MAP) {
                     if (idx->type != VAL_STRING) runtime_error(n->assign.tgt, "字典键必须是字符串");
                     dict_set(obj->mval, idx->sval, val);
@@ -4422,13 +4913,13 @@ static void exec_node(Node *n, Env *env) {
         case ND_FOR: {
             Value *start_v = eval_node(n->for_stmt.start, env);
             Value *end_v = eval_node(n->for_stmt.end, env);
-            double start = (start_v->type == VAL_FLOAT) ? start_v->fval : start_v->ival;
-            double end = (end_v->type == VAL_FLOAT) ? end_v->fval : end_v->ival;
+            double start = num_of(start_v, "循环起点");
+            double end   = num_of(end_v,   "循环终点");
             double step = 1.0;
             int step_is_float = 0;
             if (n->for_stmt.step) {
                 Value *step_v = eval_node(n->for_stmt.step, env);
-                step = (step_v->type == VAL_FLOAT) ? step_v->fval : step_v->ival;
+                step = num_of(step_v, "循环步长");
                 step_is_float = (step_v->type == VAL_FLOAT);
                 val_free(step_v);
             }
@@ -4588,6 +5079,112 @@ static void exec_node(Node *n, Env *env) {
             val_free(ev);
             break;
         }
+        case ND_THROW: {
+            Value *v = eval_node(n->throw_stmt.expr, env);
+            Value *err;
+            if (v->type == VAL_MAP) {
+                err = v;                 /* 已是错误对象：原样再抛出，保留原始位置 */
+            } else {
+                char *s = val_to_string(v);
+                err = make_error_value("抛出", s ? s : "", n->line, n->col);
+                free(s);
+                val_free(v);
+            }
+            if (g_try_depth == 0) die_uncaught(err);
+            throw_to_frame(err);
+            break;
+        }
+        case ND_TRY: {
+            if (g_try_depth >= MAX_TRY_DEPTH)
+                runtime_error(n, "尝试 块嵌套过深（超过 %d 层）", MAX_TRY_DEPTH);
+
+            TryFrame *f = &g_try[g_try_depth];
+            f->log = NULL;  f->nlog = f->caplog = 0;
+            f->envs = NULL; f->nenv = f->capenv = 0;
+            f->recording = 1;
+
+            /* longjmp 会跳过 invoke_func 里对这些执行状态的恢复，
+               必须自己存档：否则捕获一次异常后调用深度只增不减、
+               循环控制与返回标志也会残留，程序逻辑随之错乱。 */
+            volatile int          sv_depth = g_call_depth;
+            LoopContext * volatile sv_loop = loop_ctx;
+            volatile int          sv_rflag = g_return_flag;
+            Value       * volatile sv_rval = g_return_value;
+            const char  * volatile sv_rtyp = g_cur_ret_type;
+            volatile int caught = 0;
+
+            g_try_depth++;
+            if (setjmp(f->jb) == 0) {
+                for (int i = 0; i < n->try_stmt.bcnt; i++) {
+                    exec_node(n->try_stmt.body[i], env);
+                    if (g_return_flag) break;
+                    if (loop_ctx && (loop_ctx->should_break || loop_ctx->should_continue)) break;
+                }
+                /* 正常走完：弹帧但不回滚——该释放的都已经正常释放过了 */
+                g_try_depth--;
+                f->recording = 0;
+                free(f->log);  f->log = NULL;  f->nlog = f->caplog = 0;
+                free(f->envs); f->envs = NULL; f->nenv = f->capenv = 0;
+            } else {
+                /* 异常路径：帧已在 throw_to_frame 中弹出并回滚完毕 */
+                caught = 1;
+                g_call_depth   = sv_depth;
+                loop_ctx       = sv_loop;
+                g_return_flag  = sv_rflag;
+                g_return_value = sv_rval;
+                g_cur_ret_type = sv_rtyp;
+            }
+
+            if (caught) {
+                Value *exc = g_exc_value;   /* 接管载荷所有权 */
+                g_exc_value = NULL;
+                /* 把这一份引用托管给【外层】帧：捕获块自身也可能抛异常，
+                   那时下面的 val_free(exc) 会被跳过。登记后由外层回滚兜底；
+                   正常走完时 val_free 内部会登记 -1 自动抵消，两条路径对称。 */
+                reflog_add(exc, +1);
+                if (n->try_stmt.has_catch) {
+                    if (n->try_stmt.var) env_set(env, n->try_stmt.var, exc);
+                    for (int i = 0; i < n->try_stmt.ccnt; i++) {
+                        exec_node(n->try_stmt.cbody[i], env);
+                        if (g_return_flag) break;
+                        if (loop_ctx && (loop_ctx->should_break || loop_ctx->should_continue)) break;
+                    }
+                    val_free(exc);          /* 交还我们持有的那一份 */
+                    /* 有 捕获：异常到此为止，最终 块在下方统一执行 */
+                } else {
+                    /* 只有 最终 没有 捕获：先做清理，再把异常继续往外抛 */
+                    for (int i = 0; i < n->try_stmt.fcnt; i++)
+                        exec_node(n->try_stmt.fbody[i], env);
+                    if (g_try_depth == 0) die_uncaught(exc);
+                    throw_to_frame(exc);
+                }
+            }
+
+            /* 最终 块：正常结束、以及"捕获处理完"两种情况都要执行。
+               注意 exec_node 开头就会因 g_return_flag / 跳出 / 继续 直接返回，
+               所以必须先把这些"挂起中的控制流"摘下来，跑完清理再挂回去 ——
+               否则 `尝试 ... 返回 x ... 最终 ...` 的清理代码会被静默跳过。 */
+            if (n->try_stmt.has_finally && (!caught || n->try_stmt.has_catch)) {
+                int    sf = g_return_flag;
+                Value *sv = g_return_value;
+                int    sb = loop_ctx ? loop_ctx->should_break    : 0;
+                int    sc = loop_ctx ? loop_ctx->should_continue : 0;
+                g_return_flag = 0; g_return_value = NULL;
+                if (loop_ctx) { loop_ctx->should_break = 0; loop_ctx->should_continue = 0; }
+
+                for (int i = 0; i < n->try_stmt.fcnt; i++)
+                    exec_node(n->try_stmt.fbody[i], env);
+
+                /* 清理块自己若也 返回，则以它为准（与主流语言一致），旧返回值丢弃 */
+                if (!g_return_flag) { g_return_flag = sf; g_return_value = sv; }
+                else if (sv) val_free(sv);
+                if (loop_ctx) {
+                    if (!loop_ctx->should_break)    loop_ctx->should_break    = sb;
+                    if (!loop_ctx->should_continue) loop_ctx->should_continue = sc;
+                }
+            }
+            break;
+        }
         case ND_BREAK: {
             if (!loop_ctx || !loop_ctx->in_loop) {
                 runtime_error(n, "跳出语句只能在循环内使用");
@@ -4612,6 +5209,7 @@ static void exec_node(Node *n, Env *env) {
 
 /* ========== 主程序 ========== */
 int main(int argc, char **argv) {
+    stack_guard_init(0);          /* 必须最先执行：以 main 的栈帧为基准 */
     srand((unsigned int)time(NULL));
     env_lock_init();
     

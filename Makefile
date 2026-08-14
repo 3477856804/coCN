@@ -14,7 +14,7 @@ DEMOS    = $(wildcard 例子/*.co)
 co: co.c
 	$(CC) $(CFLAGS) -o co co.c $(LDLIBS)
 
-.PHONY: test test-suite test-error test-demo asan tsan check clean
+.PHONY: test test-suite test-error test-demo asan asan-error tsan check clean
 
 # 默认测试：功能套件 + 错误路径 + 全部例子
 test: test-suite test-error test-demo
@@ -71,6 +71,20 @@ asan: co.c
 		else echo "干净"; fi; \
 	done
 
+# 错误路径的内存安全检查：错误路径会 exit(1)，进程退出时必然有未回收内存，
+# 所以关闭泄漏检测，只查【越界读写 / 释放后使用 / 未定义行为】——
+# 这类问题在错误路径上最容易藏（如张量索引越界曾直接读写堆外内存）。
+asan-error: co.c
+	@test -x co_asan || $(CC) $(SAN_CFLAGS) $(ASAN_FLAGS) -o co_asan co.c $(LDLIBS)
+	@echo "---- ASan 错误路径（只查越界/UB，不查泄漏）----"
+	@for f in $(ERRCASES); do \
+		printf "%-34s " "$$f"; \
+		out=$$(ASAN_OPTIONS=detect_leaks=0 ./co_asan "$$f" 2>&1); \
+		if echo "$$out" | grep -qE "ERROR: AddressSanitizer|runtime error:"; then \
+			echo "检出内存问题"; echo "$$out" | grep -E "SUMMARY|runtime error:" | head -3; exit 1; \
+		else echo "干净"; fi; \
+	done
+
 # 数据竞争检查（针对并发用例）
 tsan: co.c
 	$(CC) $(SAN_CFLAGS) $(TSAN_FLAGS) -o co_tsan co.c $(LDLIBS)
@@ -84,9 +98,9 @@ tsan: co.c
 	done
 
 # 提交前的完整门禁
-check: test asan tsan
+check: test asan asan-error tsan
 	@echo "===================================="
-	@echo " 全部门禁通过：功能 + 错误路径 + ASan/UBSan + TSan"
+	@echo " 全部门禁通过：功能 + 错误路径 + ASan/UBSan + 错误路径内存安全 + TSan"
 	@echo "===================================="
 
 clean:
