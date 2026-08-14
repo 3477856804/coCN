@@ -1,9 +1,9 @@
 CC      = gcc
-CFLAGS  = -O2 -Wall
+CFLAGS  = -O2 -Wall -Wextra
 LDLIBS  = -lm -lpthread
 
 # 净化器构建参数（回归验证用，非发布产物）
-SAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -Wall
+SAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -Wall -Wextra
 ASAN_FLAGS  = -fsanitize=address,undefined
 TSAN_FLAGS  = -fsanitize=thread
 

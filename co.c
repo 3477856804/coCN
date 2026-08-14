@@ -11,6 +11,7 @@
 #include <sys/time.h>
 #include <setjmp.h>
 #include <sys/resource.h>   /* getrlimit：探测真实栈容量 */
+#include <errno.h>          /* strtoull 溢出检测：进制字面量必须拒绝越界而非静默回绕 */
 
 /* ========== 基础定义 ========== */
 #define MAX_ID_LEN     128
@@ -869,6 +870,8 @@ typedef enum {
     TOK_EOF, TOK_ID, TOK_INT, TOK_FLOAT, TOK_STRING, TOK_MULTILINE_STRING,
     TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_DBLSLASH, TOK_MOD,
     TOK_EQ, TOK_NE, TOK_LT, TOK_LE, TOK_GT, TOK_GE,
+    /* 位运算：系统编程基石（& | ^ ~ << >>，另有中文别名） */
+    TOK_AMP, TOK_PIPE, TOK_CARET, TOK_TILDE, TOK_SHL, TOK_SHR,
     TOK_ASSIGN, TOK_LPAREN, TOK_RPAREN, TOK_LBRACK, TOK_RBRACK,
     TOK_LBRACE, TOK_RBRACE, TOK_COLON, TOK_COMMA, TOK_NEWLINE, TOK_DOT,
     /* 中文关键字 */
@@ -1001,19 +1004,61 @@ static void advance() {
         cur_tok.type = TOK_STRING;
         return;
     }
-    /* 数字 */
-    if (isdigit(src[src_pos])) {
-        int st = src_pos;
-        while (isdigit(src[src_pos])) { src_pos++; src_col++; }
-        if (src[src_pos] == '.') {
+    /* 数字：十进制 / 0x十六进制 / 0b二进制 / 0o八进制，均支持 _ 分隔符。
+       系统编程离不开位模式字面量（0xFF、0b1010_0101），进制在词法期就折算成十进制文本，
+       AST 与求值层无需感知进制；溢出一律报错，绝不静默回绕。 */
+    if (isdigit((unsigned char)src[src_pos])) {
+        char pfx = src[src_pos + 1];
+        if (src[src_pos] == '0' && (pfx=='x'||pfx=='X'||pfx=='b'||pfx=='B'||pfx=='o'||pfx=='O')) {
+            int base = (pfx=='x'||pfx=='X') ? 16 : (pfx=='b'||pfx=='B') ? 2 : 8;
+            src_pos += 2; src_col += 2;
+            char digits[MAX_ID_LEN]; int dn = 0, ndig = 0;
+            while (src[src_pos]) {
+                char ch = src[src_pos];
+                if (ch == '_') { src_pos++; src_col++; continue; }   /* 分隔符仅作视觉分组 */
+                int ok = (base == 16) ? isxdigit((unsigned char)ch)
+                       : (base == 8)  ? (ch >= '0' && ch <= '7')
+                                      : (ch == '0' || ch == '1');
+                if (!ok) break;
+                if (dn < (int)sizeof(digits) - 1) digits[dn++] = ch;
+                ndig++; src_pos++; src_col++;
+            }
+            digits[dn] = 0;
+            if (ndig == 0) lex_error("进制前缀后缺少有效数字");
+            /* 紧跟字母/数字说明数字写错了进制（如 0b12、0xG、0o8） */
+            if (isalnum((unsigned char)src[src_pos]))
+                lex_error("进制字面量中出现该进制不允许的数字");
+            if (ndig >= (int)sizeof(digits) - 1) lex_error("整数字面量超出范围");
+            errno = 0;
+            unsigned long long uv = strtoull(digits, NULL, base);
+            if (errno == ERANGE || uv > 9223372036854775807ULL) lex_error("整数字面量超出范围");
+            snprintf(cur_tok.text, MAX_ID_LEN, "%lld", (long long)uv);
+            cur_tok.type = TOK_INT;
+            return;
+        }
+        char buf[MAX_ID_LEN]; int bn = 0;
+        while (isdigit((unsigned char)src[src_pos]) || src[src_pos] == '_') {
+            if (src[src_pos] != '_' && bn < (int)sizeof(buf) - 1) buf[bn++] = src[src_pos];
             src_pos++; src_col++;
-            while (isdigit(src[src_pos])) { src_pos++; src_col++; }
-            int len = src_pos - st;
-            strncpy(cur_tok.text, src + st, len); cur_tok.text[len] = 0;
+        }
+        if (src[src_pos] == '.') {
+            if (bn < (int)sizeof(buf) - 1) buf[bn++] = '.';
+            src_pos++; src_col++;
+            while (isdigit((unsigned char)src[src_pos]) || src[src_pos] == '_') {
+                if (src[src_pos] != '_' && bn < (int)sizeof(buf) - 1) buf[bn++] = src[src_pos];
+                src_pos++; src_col++;
+            }
+            buf[bn] = 0;
+            memcpy(cur_tok.text, buf, bn + 1);
             cur_tok.type = TOK_FLOAT;
         } else {
-            int len = src_pos - st;
-            strncpy(cur_tok.text, src + st, len); cur_tok.text[len] = 0;
+            buf[bn] = 0;
+            /* 十进制整数同样要拒绝越界：atol 溢出是未定义行为 */
+            errno = 0;
+            char *endp = NULL;
+            unsigned long long uv = strtoull(buf, &endp, 10);
+            if (errno == ERANGE || uv > 9223372036854775807ULL) lex_error("整数字面量超出范围");
+            memcpy(cur_tok.text, buf, bn + 1);
             cur_tok.type = TOK_INT;
         }
         return;
@@ -1073,6 +1118,13 @@ static void advance() {
         else if (strcmp(cur_tok.text, "且") == 0) cur_tok.type = TK_AND;
         else if (strcmp(cur_tok.text, "或") == 0) cur_tok.type = TK_OR;
         else if (strcmp(cur_tok.text, "非") == 0) cur_tok.type = TK_NOT;
+        /* 位运算中文别名：AST 里统一存 ASCII 符号（op 字段仅 8 字节，装不下 3 个汉字） */
+        else if (strcmp(cur_tok.text, "按位与") == 0)   { cur_tok.type = TOK_AMP;   strcpy(cur_tok.text, "&");  }
+        else if (strcmp(cur_tok.text, "按位或") == 0)   { cur_tok.type = TOK_PIPE;  strcpy(cur_tok.text, "|");  }
+        else if (strcmp(cur_tok.text, "按位异或") == 0) { cur_tok.type = TOK_CARET; strcpy(cur_tok.text, "^");  }
+        else if (strcmp(cur_tok.text, "按位取反") == 0) { cur_tok.type = TOK_TILDE; strcpy(cur_tok.text, "~");  }
+        else if (strcmp(cur_tok.text, "左移") == 0)     { cur_tok.type = TOK_SHL;   strcpy(cur_tok.text, "<<"); }
+        else if (strcmp(cur_tok.text, "右移") == 0)     { cur_tok.type = TOK_SHR;   strcpy(cur_tok.text, ">>"); }
         /* 强语言特性关键字 */
         else if (strcmp(cur_tok.text, "真") == 0) cur_tok.type = TK_TRUE;
         else if (strcmp(cur_tok.text, "假") == 0) cur_tok.type = TK_FALSE;
@@ -1137,15 +1189,26 @@ static void advance() {
             else { cur_tok.type = TOK_ASSIGN; cur_tok.text[0] = '='; cur_tok.text[1] = 0; }
             return;
         case '<':
-            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_LE; strcpy(cur_tok.text, "<="); return; }
+            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_LE;  strcpy(cur_tok.text, "<="); return; }
+            if (src[src_pos] == '<') { src_pos++; src_col++; cur_tok.type = TOK_SHL; strcpy(cur_tok.text, "<<"); return; }
             cur_tok.type = TOK_LT; break;
         case '>':
-            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_GE; strcpy(cur_tok.text, ">="); return; }
+            if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_GE;  strcpy(cur_tok.text, ">="); return; }
+            if (src[src_pos] == '>') { src_pos++; src_col++; cur_tok.type = TOK_SHR; strcpy(cur_tok.text, ">>"); return; }
             cur_tok.type = TOK_GT; break;
         case '!':
             if (src[src_pos] == '=') { src_pos++; src_col++; cur_tok.type = TOK_NE; strcpy(cur_tok.text, "!="); return; }
             lex_error("未知符号 '!'，期望 '!='");
             break;
+        /* 位运算符：&& / || 明确报错并指引到中文逻辑运算符，避免与「按位」语义混淆 */
+        case '&':
+            if (src[src_pos] == '&') lex_error("不支持 '&&'，逻辑与请用 '且'，按位与请用单个 '&' 或 '按位与'");
+            cur_tok.type = TOK_AMP; break;
+        case '|':
+            if (src[src_pos] == '|') lex_error("不支持 '||'，逻辑或请用 '或'，按位或请用单个 '|' 或 '按位或'");
+            cur_tok.type = TOK_PIPE; break;
+        case '^': cur_tok.type = TOK_CARET; break;
+        case '~': cur_tok.type = TOK_TILDE; break;
         default: 
             fprintf(stderr, "未识别的字符: 0x%02X at line=%d col=%d pos=%d\n", 
                     (unsigned char)c, src_line, src_col, src_pos);
@@ -1549,6 +1612,13 @@ static Node *parse_primary() {
         expect(TOK_RBRACE);
         return n;
     } else {
+        /* 多余的 结束 是最常见的手误，直接给出可操作的提示，而不是干巴巴报个符号 */
+        if (cur_tok.type == TK_END) {
+            fprintf(stderr, "语法错误 (第%d行,%d列): 多余的 '结束'"
+                            "（单行的「如果 … 则 …」若要写 结束，必须写在同一行）\n",
+                    cur_tok.line, cur_tok.col);
+            exit(1);
+        }
         fprintf(stderr, "语法错误 (第%d行,%d列): 意外的符号 '%s'\n", cur_tok.line, cur_tok.col, cur_tok.text);
         exit(1);
     }
@@ -1617,6 +1687,13 @@ static Node *parse_unary() {
         n->unary.operand = parse_unary();
         return n;
     }
+    if (cur_tok.type == TOK_TILDE) {   /* ~x / 按位取反 x */
+        advance();
+        Node *n = make_node(ND_UNARY);
+        strcpy(n->unary.op, "~");
+        n->unary.operand = parse_unary();
+        return n;
+    }
     return parse_postfix();
 }
 
@@ -1649,11 +1726,26 @@ static Node *parse_add() {
     return left;
 }
 
-static Node *parse_cmp() {
+/* 移位：优先级高于比较、低于加减（与 C 一致，避免 1 << 2 + 3 被误读） */
+static Node *parse_shift() {
     Node *left = parse_add();
-    while (cur_tok.type == TOK_LT || cur_tok.type == TOK_LE || cur_tok.type == TOK_GT || cur_tok.type == TOK_GE) {
+    while (cur_tok.type == TOK_SHL || cur_tok.type == TOK_SHR) {
         Token op = cur_tok; advance();
         Node *right = parse_add();
+        Node *n = make_node(ND_BINARY);
+        n->binary.left = left;
+        n->binary.right = right;
+        strcpy(n->binary.op, op.text);
+        left = n;
+    }
+    return left;
+}
+
+static Node *parse_cmp() {
+    Node *left = parse_shift();
+    while (cur_tok.type == TOK_LT || cur_tok.type == TOK_LE || cur_tok.type == TOK_GT || cur_tok.type == TOK_GE) {
+        Token op = cur_tok; advance();
+        Node *right = parse_shift();
         Node *n = make_node(ND_BINARY);
         n->binary.left = left;
         n->binary.right = right;
@@ -1677,11 +1769,55 @@ static Node *parse_eq() {
     return left;
 }
 
-static Node *parse_and() {
+/* 位运算三层：& 高于 ^ 高于 |，整体位于「相等比较」与「逻辑与」之间。
+   与 C 完全一致的优先级，熟悉系统编程的人不必重新背表。 */
+static Node *parse_bitand() {
     Node *left = parse_eq();
-    while (cur_tok.type == TK_AND) {
+    while (cur_tok.type == TOK_AMP) {
         advance();
         Node *right = parse_eq();
+        Node *n = make_node(ND_BINARY);
+        n->binary.left = left;
+        n->binary.right = right;
+        strcpy(n->binary.op, "&");
+        left = n;
+    }
+    return left;
+}
+
+static Node *parse_bitxor() {
+    Node *left = parse_bitand();
+    while (cur_tok.type == TOK_CARET) {
+        advance();
+        Node *right = parse_bitand();
+        Node *n = make_node(ND_BINARY);
+        n->binary.left = left;
+        n->binary.right = right;
+        strcpy(n->binary.op, "^");
+        left = n;
+    }
+    return left;
+}
+
+static Node *parse_bitor() {
+    Node *left = parse_bitxor();
+    while (cur_tok.type == TOK_PIPE) {
+        advance();
+        Node *right = parse_bitxor();
+        Node *n = make_node(ND_BINARY);
+        n->binary.left = left;
+        n->binary.right = right;
+        strcpy(n->binary.op, "|");
+        left = n;
+    }
+    return left;
+}
+
+static Node *parse_and() {
+    Node *left = parse_bitor();
+    while (cur_tok.type == TK_AND) {
+        advance();
+        Node *right = parse_bitor();
         Node *n = make_node(ND_BINARY);
         n->binary.left = left;
         n->binary.right = right;
@@ -1842,7 +1978,14 @@ static Node *parse_if() {
         branches[br_cnt++] = br;
     }
 
+    /* 单行形式允许把 结束 写在同一行：如果 a 则 b 结束
+       这是最自然的一行写法，可此前单行 if 不消费 结束，
+       于是这个 结束 被外层的 当/函数/对于 抢走，报出「少一个 结束」的
+       莫名其妙的语法错误 —— 典型的「写着对、解析错」。
+       判定依据：parse_statement 不吞换行，所以此刻还能看到 TK_END
+       就说明它与 如果 在同一行；跨行的 结束 属于外层块，绝不抢。 */
     if (block_form) expect(TK_END);
+    else if (cur_tok.type == TK_END) advance();
     Node *n = make_node(ND_IF);
     n->if_stmt.cond = cond;
     n->if_stmt.then_body = then_body;
@@ -2490,6 +2633,73 @@ static Value *builtin_sign(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "符号函数需要1个参数");
     double x = num_of(argv[0], "符号");
     return val_int(x > 0 ? 1 : (x < 0 ? -1 : 0));
+}
+
+/* ===== 进制与位工具：系统编程的日常刚需 =====
+   统一按 64 位补码位模式呈现，负数不再打印成「-0x...」这种没法直接对照寄存器的形式。
+   可选第 2 参数为最小宽度（左侧补 0），便于对齐输出寄存器/掩码。 */
+static Value *bit_format(int argc, Value **argv, int base, const char *who, const char *prefix) {
+    if (argc < 1 || argc > 2) runtime_error(NULL, "%s函数需要1或2个参数（数值[, 最小宽度]）", who);
+    if (!(argv[0]->type == VAL_INT || argv[0]->type == VAL_BOOL))
+        runtime_error(NULL, "%s函数需要整数，收到 %s", who, val_type_name(argv[0]));
+    unsigned long long u = (unsigned long long)argv[0]->ival;
+    int width = 0;
+    if (argc == 2) {
+        long w = int_of(argv[1], who);
+        if (w < 0 || w > 64) runtime_error(NULL, "%s函数的最小宽度须在 0~64 之间，收到 %ld", who, w);
+        width = (int)w;
+    }
+    char digits[65]; int dn = 0;
+    const char *tbl = "0123456789abcdef";
+    if (u == 0) digits[dn++] = '0';
+    while (u) { digits[dn++] = tbl[u % (unsigned)base]; u /= (unsigned)base; }
+    while (dn < width) digits[dn++] = '0';
+    char out[80]; int on = 0;
+    for (const char *p = prefix; *p; p++) out[on++] = *p;
+    for (int i = dn - 1; i >= 0; i--) out[on++] = digits[i];
+    out[on] = 0;
+    Value *r = val_new(VAL_STRING);
+    r->sval = strdup(out);
+    return r;
+}
+static Value *builtin_hex(int argc, Value **argv) { return bit_format(argc, argv, 16, "十六进制", "0x"); }
+static Value *builtin_bin(int argc, Value **argv) { return bit_format(argc, argv,  2, "二进制",   "0b"); }
+static Value *builtin_oct(int argc, Value **argv) { return bit_format(argc, argv,  8, "八进制",   "0o"); }
+
+/* 位计数：统计 64 位补码里为 1 的位数（popcount） */
+static Value *builtin_popcount(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "位计数函数需要1个参数");
+    if (!(argv[0]->type == VAL_INT || argv[0]->type == VAL_BOOL))
+        runtime_error(NULL, "位计数函数需要整数，收到 %s", val_type_name(argv[0]));
+    unsigned long long u = (unsigned long long)argv[0]->ival;
+    int c = 0;
+    while (u) { u &= u - 1; c++; }
+    return val_int(c);
+}
+
+/* 取位：取位(值, 第几位) → 0/1，位号从 0（最低位）开始 */
+static Value *builtin_getbit(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "取位函数需要2个参数（值, 位号）");
+    if (!(argv[0]->type == VAL_INT || argv[0]->type == VAL_BOOL))
+        runtime_error(NULL, "取位函数需要整数，收到 %s", val_type_name(argv[0]));
+    long b = int_of(argv[1], "取位");
+    if (b < 0 || b > 63) runtime_error(NULL, "位号须在 0~63 之间，收到 %ld", b);
+    unsigned long long u = (unsigned long long)argv[0]->ival;
+    return val_int((long)((u >> b) & 1ULL));
+}
+
+/* 置位：置位(值, 位号, 0或1) → 新值（不改原值） */
+static Value *builtin_setbit(int argc, Value **argv) {
+    if (argc != 3) runtime_error(NULL, "置位函数需要3个参数（值, 位号, 0或1）");
+    if (!(argv[0]->type == VAL_INT || argv[0]->type == VAL_BOOL))
+        runtime_error(NULL, "置位函数需要整数，收到 %s", val_type_name(argv[0]));
+    long b = int_of(argv[1], "置位");
+    if (b < 0 || b > 63) runtime_error(NULL, "位号须在 0~63 之间，收到 %ld", b);
+    long bit = int_of(argv[2], "置位");
+    if (bit != 0 && bit != 1) runtime_error(NULL, "置位的目标值只能是 0 或 1，收到 %ld", bit);
+    unsigned long long u = (unsigned long long)argv[0]->ival;
+    u = bit ? (u | (1ULL << b)) : (u & ~(1ULL << b));
+    return val_int((long)u);
 }
 /* 随机整数：随机整数(a, b) 返回 [a, b] 闭区间内均匀整数 */
 static Value *builtin_rand_int(int argc, Value **argv) {
@@ -3179,6 +3389,58 @@ static Value *builtin_from_code(int argc, Value **argv) {
     b[n] = '\0';
     Value *r = val_new(VAL_STRING);
     r->sval = strdup(b);
+    return r;
+}
+
+/* ===== 字节级视图：系统编程必须能直接摸到字节 =====
+   长度/下标 一律以【字符】为单位（不切碎汉字），这对文本处理是对的；
+   但编码、散列、协议解析必须按字节走，否则根本写不了。
+   因此另开一套按字节的入口，两套语义各自明确、互不污染。 */
+static Value *builtin_byte_len(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "字节数函数需要1个参数");
+    const char *s = str_arg(argv[0], "字节数");
+    return val_int((long)strlen(s));
+}
+
+static Value *builtin_byte_at(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "字节函数需要2个参数（文本, 下标）");
+    const char *s = str_arg(argv[0], "字节");
+    long n = (long)strlen(s);
+    long i = int_of(argv[1], "字节");
+    if (i < 0) i += n;                       /* 负下标：-1 表示最后一个字节 */
+    if (i < 0 || i >= n) runtime_error(NULL, "字节下标越界: %ld（共 %ld 字节）", i, n);
+    return val_int((long)(unsigned char)s[i]);
+}
+
+static Value *builtin_bytes_of(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "字节列表函数需要1个参数");
+    const char *s = str_arg(argv[0], "字节列表");
+    long n = (long)strlen(s);
+    Value *lst = list_new_empty();
+    for (long i = 0; i < n; i++) {
+        Value *b = val_int((long)(unsigned char)s[i]);
+        list_push(lst, b);
+        val_free(b);                          /* list_push 内部已 retain */
+    }
+    return lst;
+}
+
+static Value *builtin_bytes_to_str(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "字节转文本函数需要1个参数（字节列表）");
+    if (argv[0]->type != VAL_LIST) runtime_error(NULL, "字节转文本函数需要列表，收到 %s", val_type_name(argv[0]));
+    int n = argv[0]->list_len;
+    /* 用异常安全的临时缓冲：中途遇到非法字节会 longjmp，普通 malloc 会泄漏 */
+    char *buf = (char *)co_tmp_alloc((size_t)n + 1);
+    for (int i = 0; i < n; i++) {
+        long b = int_of(argv[0]->lval[i], "字节转文本");
+        if (b < 0 || b > 255) runtime_error(NULL, "字节值须在 0~255 之间，第 %d 项是 %ld", i, b);
+        if (b == 0) runtime_error(NULL, "字节值不能是 0（字符串以 0 结尾，会被截断）");
+        buf[i] = (char)(unsigned char)b;
+    }
+    buf[n] = '\0';
+    Value *r = val_new(VAL_STRING);
+    r->sval = strdup(buf);
+    co_tmp_free(buf);
     return r;
 }
 
@@ -4027,6 +4289,13 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "圆周率") == 0) return builtin_pi(argc, argv);
     if (strcmp(name, "符号") == 0) return builtin_sign(argc, argv);
     if (strcmp(name, "随机整数") == 0) return builtin_rand_int(argc, argv);
+    /* 进制与位工具 */
+    if (strcmp(name, "十六进制") == 0) return builtin_hex(argc, argv);
+    if (strcmp(name, "二进制") == 0) return builtin_bin(argc, argv);
+    if (strcmp(name, "八进制") == 0) return builtin_oct(argc, argv);
+    if (strcmp(name, "位计数") == 0) return builtin_popcount(argc, argv);
+    if (strcmp(name, "取位") == 0) return builtin_getbit(argc, argv);
+    if (strcmp(name, "置位") == 0) return builtin_setbit(argc, argv);
     /* 列表函数 */
     if (strcmp(name, "追加") == 0) return builtin_append(argc, argv);
     if (strcmp(name, "删除") == 0) return builtin_remove(argc, argv);
@@ -4069,6 +4338,11 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "结尾是") == 0) return builtin_endswith(argc, argv);
     if (strcmp(name, "字符码") == 0) return builtin_char_code(argc, argv);
     if (strcmp(name, "码转字符") == 0) return builtin_from_code(argc, argv);
+    /* 字节级视图（编码/散列/协议解析用） */
+    if (strcmp(name, "字节数") == 0) return builtin_byte_len(argc, argv);
+    if (strcmp(name, "字节") == 0) return builtin_byte_at(argc, argv);
+    if (strcmp(name, "字节列表") == 0) return builtin_bytes_of(argc, argv);
+    if (strcmp(name, "字节转文本") == 0) return builtin_bytes_to_str(argc, argv);
     /* 文件读写 */
     if (strcmp(name, "读文件") == 0) return builtin_read_file(argc, argv);
     if (strcmp(name, "写文件") == 0) return builtin_write_file(argc, argv);
@@ -4439,6 +4713,45 @@ static Value *eval_node(Node *n, Env *env) {
                     return val_bool(is_lt ? c < 0 : is_gt ? c > 0 : is_le ? c <= 0 : c >= 0);
                 }
             }
+            /* 位运算：& | ^ << >>。
+               只接受整数/布尔——浮点的位模式没有语言级意义，静默截断是「能跑但结果错」的温床，
+               因此一律报错并指引用户显式 取整。移位位数越界会触发 C 的未定义行为，
+               这里先拦截为中文错误；左移用无符号运算避免有符号溢出 UB，
+               右移手写算术移位保证负数行为在所有平台一致（不依赖实现定义）。 */
+            {
+                const char *bop = n->binary.op;
+                int is_band = (strcmp(bop, "&")  == 0), is_bor  = (strcmp(bop, "|")  == 0);
+                int is_bxor = (strcmp(bop, "^")  == 0);
+                int is_shl  = (strcmp(bop, "<<") == 0), is_shr  = (strcmp(bop, ">>") == 0);
+                if (is_band || is_bor || is_bxor || is_shl || is_shr) {
+                    int lok = (l->type == VAL_INT || l->type == VAL_BOOL);
+                    int rok = (r->type == VAL_INT || r->type == VAL_BOOL);
+                    if (!lok || !rok) {
+                        const char *ln = val_type_name(l), *rn = val_type_name(r);
+                        char opbuf[8]; snprintf(opbuf, sizeof(opbuf), "%s", bop);
+                        val_free(l); val_free(r);
+                        runtime_error(n, "位运算 %s 需要整数，收到 %s %s %s（浮点请先用 取整 转换）",
+                                      opbuf, ln, opbuf, rn);
+                    }
+                    long a = l->ival, b = r->ival, res = 0;
+                    val_free(l); val_free(r);
+                    if (is_shl || is_shr) {
+                        if (b < 0)  runtime_error(n, "移位位数不能为负: %ld", b);
+                        if (b > 63) runtime_error(n, "移位位数超出范围: %ld（0~63）", b);
+                        if (is_shl) {
+                            res = (long)((unsigned long)a << b);
+                        } else {
+                            /* 算术右移的可移植写法：负数用补码取反两次实现符号填充 */
+                            res = (a < 0) ? (long)~((~(unsigned long)a) >> b)
+                                          : (long)((unsigned long)a >> b);
+                        }
+                    }
+                    else if (is_band) res = a & b;
+                    else if (is_bor)  res = a | b;
+                    else              res = a ^ b;
+                    return val_int(res);
+                }
+            }
             /* 字符串拼接：只有 + 才拼接。
                以前任何运算符碰到字符串都会拼接，导致 "a" - 1 静默产出 "a1" 这种荒谬结果。 */
             if (l->type == VAL_STRING || r->type == VAL_STRING) {
@@ -4545,6 +4858,14 @@ static Value *eval_node(Node *n, Env *env) {
                 int b = truthy(v);
                 val_free(v);
                 return val_bool(!b);
+            } else if (strcmp(n->unary.op, "~") == 0) {
+                /* 按位取反只对整数有意义；布尔按 0/1 参与，结果是整数（真 → -2） */
+                if (v->type == VAL_INT || v->type == VAL_BOOL) {
+                    long x = v->ival; val_free(v); return val_int(~x);
+                }
+                const char *tn = val_type_name(v);
+                val_free(v);
+                runtime_error(n, "按位取反需要整数，得到 %s（浮点请先用 取整 转换）", tn);
             }
             return v;
         }
