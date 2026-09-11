@@ -11,7 +11,10 @@ ifeq ($(OS),Windows_NT)
 LDLIBS += -lshell32
 # Windows 主线程默认栈仅 2MB（Linux 默认 8MB），深递归用例会被栈守卫误伤：
 # 提高到 16MB，与 Linux 默认值对齐并留出净化器构建的余量。
-CFLAGS += -Wl,--stack,16777216
+# -static：MSYS2 的 -lpthread 默认动态链接 libwinpthread-1.dll，该 DLL 不属于
+# 系统基线，直接在 PowerShell/资源管理器运行会报「找不到 libwinpthread-1.dll」。
+# 静态链入后 co.exe 只依赖系统 DLL，任何 Windows 环境开箱即用。
+CFLAGS += -Wl,--stack,16777216 -static
 endif
 
 # 净化器构建参数（回归验证用，非发布产物）

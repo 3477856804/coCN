@@ -6565,7 +6565,13 @@ static int do_compile(const char *mode, const char *infile, const char *outarg) 
 #else
         const char *tmpbin = bin;
 #endif
+        /* Windows 上额外 -static：与 co.exe 本体同理，libwinpthread 不属于系统
+           基线，动态链接的产物离开 MSYS2 环境就无法运行。 */
+#ifdef _WIN32
+        char cmd[2048]; snprintf(cmd, sizeof cmd, "cc -O2 -Wall -Wextra -static %s -o %s -lm", tmpc, tmpbin);
+#else
         char cmd[2048]; snprintf(cmd, sizeof cmd, "cc -O2 -Wall -Wextra %s -o %s -lm", tmpc, tmpbin);
+#endif
         int r = system(cmd);
         if (r != 0) { fprintf(stderr, "编译失败（C 源码已暂存于 %s）\n", tmpc); node_free(prog); free(buf); return 1; }
         remove(tmpc);
