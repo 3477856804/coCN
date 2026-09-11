@@ -6590,6 +6590,15 @@ static int do_compile(const char *mode, const char *infile, const char *outarg) 
 }
 
 /* ========== 主程序 ========== */
+#ifdef _WIN32
+/* 双击启动时窗口会在脚本跑完后直接关闭，输出看不清；交互场景下暂停一次。 */
+static void co_console_pause(void) {
+    if (!isatty(_fileno(stdin)) || !isatty(_fileno(stdout))) return; /* 非真控制台：别挡管道 */
+    fprintf(stderr, "\n运行结束，按回车键退出...");
+    while (fgetc(stdin) != '\n' && !feof(stdin)) {}
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     co_win_args(&argc, &argv);    /* 命令行参数 UTF-16 → UTF-8：中文路径可用 */
@@ -6598,6 +6607,41 @@ int main(int argc, char **argv) {
     stack_guard_init(0);          /* 必须最先执行：以 main 的栈帧为基准 */
     srand((unsigned int)time(NULL));
     env_lock_init();
+
+#ifdef _WIN32
+    /* 双击 co.exe（无参数、stdin 是控制台）：进入拖拽模式，提示选择脚本。
+     * 控制台输入是 ANSI 代码页（中文系统为 GBK），须转成内部统一的 UTF-8。 */
+    if (argc < 2 && isatty(_fileno(stdin))) {
+        static char raw[2048], u8[4096];
+        fprintf(stderr,
+            "coCN 中文编程语言\n"
+            "把 .co 脚本文件拖进本窗口（或直接输入路径）后按回车运行。\n"
+            "> ");
+        argv[1] = NULL;
+        if (fgets(raw, sizeof raw, stdin)) {
+            char *p = raw, *e;
+            while (*p == ' ' || *p == '\t' || *p == '"') p++;          /* 拖拽路径可能带引号 */
+            e = p + strlen(p);
+            while (e > p && (e[-1]=='\r' || e[-1]=='\n' || e[-1]=='"' || e[-1]==' ')) e--;
+            *e = 0;
+            if (*p) {
+                int wn = MultiByteToWideChar(CP_ACP, 0, p, -1, NULL, 0);
+                if (wn > 0) {
+                    wchar_t *w = (wchar_t *)malloc((size_t)wn * sizeof(wchar_t));
+                    if (w && MultiByteToWideChar(CP_ACP, 0, p, -1, w, wn) > 0) {
+                        if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u8, sizeof u8, NULL, NULL) > 0)
+                            argv[1] = u8;
+                    }
+                    free(w);
+                }
+                if (!argv[1]) argv[1] = p;  /* 转换失败按原字节试一次 */
+            }
+        }
+        if (!argv[1]) { fprintf(stderr, "未输入有效路径，退出。\n"); co_console_pause(); return 1; }
+        argc = 2;
+        atexit(co_console_pause);     /* 无论运行成败，退出前都停一下，让用户看到结果 */
+    }
+#endif
 
     if (argc >= 2 && (strcmp(argv[1], "--生成C") == 0 || strcmp(argv[1], "--编译") == 0)) {
         if (argc < 3) {
