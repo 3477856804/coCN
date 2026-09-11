@@ -100,10 +100,13 @@ done
 # ---- 第三部分：--生成C 产出必须能被独立编译，且不依赖解释器 ----
 echo "---- --生成C 产物独立可编译 ----"
 printf '%-34s ' "生成C/独立编译"
+# MinGW 的 cc 会自动给 -o 目标追加 .exe：产物落在哪就用哪个（POSIX 上无 .exe，不受影响）
+SA="$TMP/standalone"
+if [ ! -x "$SA" ] && [ -x "$SA.exe" ]; then SA="$SA.exe"; fi
 if "$CO" --生成C 例子/原生编译示例.co "$TMP/standalone.c" > /dev/null 2>&1 \
    && cc -O2 -Wall -Wextra "$TMP/standalone.c" -o "$TMP/standalone" -lm 2> "$TMP/sa.log" \
    && [ ! -s "$TMP/sa.log" ] \
-   && "$TMP/standalone" > "$TMP/sa.out" 2>&1 \
+   && "$SA" > "$TMP/sa.out" 2>&1 \
    && diff -q "$TMP/原生编译示例.interp.out" "$TMP/sa.out" > /dev/null 2>&1; then
     printf "${GRN}通过${END}\n"; PASS=$((PASS + 1))
 else

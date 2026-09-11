@@ -2,10 +2,33 @@ CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra
 LDLIBS  = -lm -lpthread
 
+# Windows / MSYS2 适配：
+#  - 中文相对路径（测试/…、例子/…）不能被 MSYS 改写成 POSIX 前缀路径，
+#    其余参数（/tmp 临时文件等）仍走正常转换；
+#  - 原生后端调用的 cc 在 shell32 提供 CommandLineToArgvW 之后链接。
+export MSYS2_ARG_CONV_EXCL = 测试;例子
+ifeq ($(OS),Windows_NT)
+LDLIBS += -lshell32
+# Windows 主线程默认栈仅 2MB（Linux 默认 8MB），深递归用例会被栈守卫误伤：
+# 提高到 16MB，与 Linux 默认值对齐并留出净化器构建的余量。
+CFLAGS += -Wl,--stack,16777216
+endif
+
 # 净化器构建参数（回归验证用，非发布产物）
 SAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -Wall -Wextra
 ASAN_FLAGS  = -fsanitize=address,undefined
 TSAN_FLAGS  = -fsanitize=thread
+
+# 平台事实：MSYS2 的 GCC 不附带任何 sanitizer 运行库（libasan/libubsan/libtsan
+# 在全部仓库中都不存在，链接时报 cannot find -lasan）。ASan 在 Windows 上改用
+# CLANG64 的 clang（compiler-rt 提供 libclang_rt.asan_dynamic）；TSan 运行库
+# 在 Windows 上不存在任何实现（仅 POSIX），tsan 目标在 Windows 明确声明跳过。
+# Windows 用法：在 CLANG64 环境（MSYSTEM=CLANG64）里执行 make asan。
+ifeq ($(OS),Windows_NT)
+SAN_CC = clang
+else
+SAN_CC = $(CC)
+endif
 
 # 测试/原生/ 里的用例双通道都要跑：
 #   解释器侧跟其余套件一样进 test-suite / asan，
@@ -63,7 +86,7 @@ test-demo: co
 
 # 内存/未定义行为检查：零泄漏、零 UB 才算通过
 asan: co.c
-	$(CC) $(SAN_CFLAGS) $(ASAN_FLAGS) -o co_asan co.c $(LDLIBS)
+	$(SAN_CC) $(SAN_CFLAGS) $(ASAN_FLAGS) -o co_asan co.c $(LDLIBS)
 	@echo "---- ASan + UBSan ----"
 	@for f in $(TESTS) $(DEMOS); do \
 		case "$$f" in *类型错误.co) continue;; esac; \
@@ -78,7 +101,7 @@ asan: co.c
 # 所以关闭泄漏检测，只查【越界读写 / 释放后使用 / 未定义行为】——
 # 这类问题在错误路径上最容易藏（如张量索引越界曾直接读写堆外内存）。
 asan-error: co.c
-	@test -x co_asan || $(CC) $(SAN_CFLAGS) $(ASAN_FLAGS) -o co_asan co.c $(LDLIBS)
+	@test -x co_asan || $(SAN_CC) $(SAN_CFLAGS) $(ASAN_FLAGS) -o co_asan co.c $(LDLIBS)
 	@echo "---- ASan 错误路径（只查越界/UB，不查泄漏）----"
 	@for f in $(ERRCASES); do \
 		printf "%-34s " "$$f"; \
@@ -102,6 +125,13 @@ bench: co
 	@sh 测试/基准运行.sh ./co 测试/基准/性能基准.co
 
 # 数据竞争检查（针对并发用例）
+# Windows 上不存在 TSan 运行库（libtsan 仅 POSIX：Linux/macOS/FreeBSD），
+# 这是平台事实而非可修复缺陷——明确声明跳过，不假装检查；POSIX 照常执行。
+ifeq ($(OS),Windows_NT)
+tsan:
+	@echo "---- TSan ----"
+	@echo "跳过：TSan 运行库在 Windows 上不存在（仅 POSIX），并发用例已在功能套件中覆盖"
+else
 tsan: co.c
 	$(CC) $(SAN_CFLAGS) $(TSAN_FLAGS) -o co_tsan co.c $(LDLIBS)
 	@echo "---- TSan ----"
@@ -112,6 +142,7 @@ tsan: co.c
 			echo "检出数据竞争"; echo "$$out" | grep -A6 "WARNING: ThreadSanitizer" | head -12; exit 1; \
 		else echo "干净"; fi; \
 	done
+endif
 
 # 提交前的完整门禁
 check: test native bench asan asan-error tsan

@@ -50,20 +50,34 @@ echo "---- 计算结果（两条通道逐字节一致）----"
 cat "$TMP/interp.out"
 
 # ---------- 门禁 2：原生产物自包含 ----------
+# 「自包含」按平台各说各话：
+#   Linux  —— 只依赖 libc/libm/动态链接器（用户机器无需装任何运行时）。
+#   Windows—— 禁止依赖 MinGW 运行时 DLL（libgcc/libstdc++/libwinpthread，
+#             否则用户机器也得装 gcc 才能跑）；KERNEL32/ucrtbase/ntdll 属于
+#             操作系统自带基线。沙箱/安全软件注入的 DLL（如本环境的
+#             aiep_sbox.dll）出现在所有进程里，视为环境噪声，不算链接依赖。
 echo ""
 echo "---- 原生产物 ----"
 SIZE=$(wc -c < "$TMP/native" | tr -d ' ')
 printf '%-14s %s 字节\n' "二进制体积" "$SIZE"
 if command -v ldd > /dev/null 2>&1; then
-    ldd "$TMP/native" 2>/dev/null | awk '{print $1}' \
-        | grep -vE '^(linux-vdso|/lib64/ld-linux|ld-linux|libc\.so|libm\.so|libgcc_s\.so)' \
-        | grep -v '^$' > "$TMP/extra_deps" || true
+    ldd "$TMP/native" 2>/dev/null | awk '{print $1}' | grep -v '^$' > "$TMP/all_deps" || true
+    if grep -qE '\.so' "$TMP/all_deps"; then
+        # Linux：白名单之外即为失败
+        grep -vE '^(linux-vdso|/lib64/ld-linux|ld-linux|libc\.so|libm\.so|libgcc_s\.so)' \
+            "$TMP/all_deps" > "$TMP/extra_deps" || true
+        WIN_MSG="仅 libc/libm（不依赖 co 解释器）"
+    else
+        # Windows：PE 产物禁止引入 MinGW 运行时 DLL
+        grep -iE 'libgcc|libstdc\+\+|libwinpthread|libco' "$TMP/all_deps" > "$TMP/extra_deps" || true
+        WIN_MSG="仅系统 DLL（不依赖 gcc 运行时与 co 解释器）"
+    fi
     if [ -s "$TMP/extra_deps" ]; then
         printf '%-14s %s\n' "额外依赖" "$(tr '\n' ' ' < "$TMP/extra_deps")"
         echo "!! 原生产物出现预期外的动态依赖 !!" >&2
         exit 1
     fi
-    printf '%-14s %s\n' "动态依赖" "仅 libc/libm（不依赖 co 解释器）"
+    printf '%-14s %s\n' "动态依赖" "$WIN_MSG"
 fi
 
 # ---------- 加速比 ----------

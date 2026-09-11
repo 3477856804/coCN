@@ -10,9 +10,96 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <setjmp.h>
+#ifdef _WIN32
+#include <windows.h>        /* VirtualQuery：Windows 上取本线程真实栈区间 */
+#else
 #include <sys/resource.h>   /* getrlimit：探测真实栈容量 */
+#endif
 #include <errno.h>          /* strtoull 溢出检测：进制字面量必须拒绝越界而非静默回绕 */
-#include <unistd.h>         /* getpid：原生编译后端临时文件名 */
+#include <unistd.h>         /* POSIX 兼容头（MinGW-w64 亦提供） */
+
+#ifdef _WIN32
+/* ========== Windows 兼容层 ==========
+   1) fopen/remove 用 ANSI 代码页解释路径，中文文件名在非 UTF-8 代码页上必挂；
+      统一改为：UTF-8 → 宽字符 → _wfopen/_wremove。
+   2) 命令行参数由 GetCommandLineW 转成 UTF-8，源码路径/输出路径才可携带中文。
+   3) 控制台输出切到 UTF-8，让中文诊断在 Windows 终端可读。 */
+#include <shellapi.h>       /* CommandLineToArgvW */
+
+static FILE *co_fopen_utf8(const char *path, const char *mode) {
+    int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    int wm = MultiByteToWideChar(CP_UTF8, 0, mode, -1, NULL, 0);
+    if (wn <= 0 || wm <= 0) return NULL;
+    wchar_t *wpath = (wchar_t *)malloc((size_t)wn * sizeof(wchar_t));
+    wchar_t *wmode = (wchar_t *)malloc((size_t)wm * sizeof(wchar_t));
+    if (!wpath || !wmode) { free(wpath); free(wmode); return NULL; }
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wn);
+    MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, wm);
+    FILE *f = _wfopen(wpath, wmode);
+    free(wpath); free(wmode);
+    return f;
+}
+#define fopen co_fopen_utf8
+
+static int co_remove_utf8(const char *path) {
+    int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (wn <= 0) return -1;
+    wchar_t *wpath = (wchar_t *)malloc((size_t)wn * sizeof(wchar_t));
+    if (!wpath) return -1;
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wn);
+    int r = _wremove(wpath);
+    free(wpath);
+    return r;
+}
+#define remove co_remove_utf8
+
+/* system() 只认 ANSI 代码页：命令串里的中文路径会乱码，改走 _wsystem */
+static int co_wsystem_utf8(const char *cmd8) {
+    int wn = MultiByteToWideChar(CP_UTF8, 0, cmd8, -1, NULL, 0);
+    if (wn <= 0) return -1;
+    wchar_t *wcmd = (wchar_t *)malloc((size_t)wn * sizeof(wchar_t));
+    if (!wcmd) return -1;
+    MultiByteToWideChar(CP_UTF8, 0, cmd8, -1, wcmd, wn);
+    int r = _wsystem(wcmd);
+    free(wcmd);
+    return r;
+}
+#define system co_wsystem_utf8
+
+/* 用宽字符 API 把产物从临时名归位到请求路径。子进程工具链（cmd→gcc→ld）
+   对非 ASCII 输出名会做有损代码页转换（产物文件名必然乱码，实测产物名
+   出现 U+FFFD），所以 gcc 只输出纯 ASCII 临时名，改名由本进程完成。 */
+static int co_move_file_utf8(const char *from8, const char *to8) {
+    int wf = MultiByteToWideChar(CP_UTF8, 0, from8, -1, NULL, 0);
+    int wt = MultiByteToWideChar(CP_UTF8, 0, to8, -1, NULL, 0);
+    if (wf <= 0 || wt <= 0) return 0;
+    wchar_t *wfrom = (wchar_t *)malloc((size_t)wf * sizeof(wchar_t));
+    wchar_t *wto   = (wchar_t *)malloc((size_t)wt * sizeof(wchar_t));
+    if (!wfrom || !wto) { free(wfrom); free(wto); return 0; }
+    MultiByteToWideChar(CP_UTF8, 0, from8, -1, wfrom, wf);
+    MultiByteToWideChar(CP_UTF8, 0, to8,   -1, wto,   wt);
+    int ok = MoveFileExW(wfrom, wto, MOVEFILE_REPLACE_EXISTING);
+    free(wfrom); free(wto);
+    return ok ? 1 : 0;
+}
+
+/* 把 UTF-16 命令行整体转成 UTF-8 的 argv；失败时保留原 argv（ASCII 场景仍可用） */
+static void co_win_args(int *argc_p, char ***argv_p) {
+    int wargc = 0;
+    wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv || wargc < 1) return;
+    char **argv = (char **)calloc((size_t)wargc, sizeof(char *));
+    if (!argv) { LocalFree(wargv); return; }
+    for (int i = 0; i < wargc; i++) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+        if (n <= 0 || !(argv[i] = (char *)malloc((size_t)n))) continue;
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], n, NULL, NULL);
+    }
+    LocalFree(wargv);
+    *argc_p = wargc;
+    *argv_p = argv;
+}
+#endif
 
 /* ========== 基础定义 ========== */
 #define MAX_ID_LEN     128
@@ -94,7 +181,7 @@ typedef struct Value {
     ValType type;
     int     refcount;
     union {
-        long      ival;
+        long long      ival;
         double    fval;
         char     *sval;
         struct Value **lval;
@@ -140,7 +227,7 @@ static struct Node **g_imported = NULL;
 static int g_imported_cnt = 0, g_imported_cap = 0;
 
 /* 前向声明：值构造与真值判断（被定义位置更靠前的内置函数引用） */
-static Value *val_int(long x);
+static Value *val_int(long long x);
 static Value *val_flt(double x);
 static Value *val_bool(int b);
 static int    truthy(Value *v);
@@ -152,7 +239,7 @@ static void   stack_guard_init(size_t total_bytes);
 static void   stack_guard_check(struct Node *site);
 static const char *val_type_name(Value *v);
 static double num_of(Value *v, const char *who);
-static long   int_of(Value *v, const char *who);
+static long long   int_of(Value *v, const char *who);
 static int    dim_of(Value *v, const char *who);
 
 /* ========== 异常机制的引用记账（RefLog） ==========
@@ -416,12 +503,12 @@ static void reflog_protect(Value *v) {
 /* 下标取值（兼容浮点下标，向零截断）。
    必须做类型检查：曾经这里裸读 union，导致 表["键"] 把字符串指针
    当下标用，越界读出垃圾值甚至崩溃。 */
-static long idx_val(Value *idx) {
+static long long idx_val(Value *idx) {
     if (!idx) runtime_error(NULL, "下标为空");
     switch (idx->type) {
         case VAL_INT:   return idx->ival;
         case VAL_BOOL:  return idx->ival ? 1 : 0;
-        case VAL_FLOAT: return (long)idx->fval;
+        case VAL_FLOAT: return (long long)idx->fval;
         default:
             runtime_error(NULL, "下标必须是数字");
             return 0;
@@ -443,31 +530,31 @@ static int utf8_seq_len(unsigned char c) {
 }
 
 /* 字符（码点）个数 */
-static long utf8_strlen(const char *s) {
-    long n = 0;
+static long long utf8_strlen(const char *s) {
+    long long n = 0;
     for (const char *p = s; *p; ) { p += utf8_seq_len((unsigned char)*p); n++; }
     return n;
 }
 
 /* 第 ci 个字符的字节偏移；ci 等于总字符数时返回 strlen；越界返回 -1 */
-static long utf8_byte_offset(const char *s, long ci) {
+static long long utf8_byte_offset(const char *s, long long ci) {
     if (ci < 0) return -1;
-    long n = 0; const char *p = s;
+    long long n = 0; const char *p = s;
     while (*p && n < ci) { p += utf8_seq_len((unsigned char)*p); n++; }
     if (n < ci) return -1;
-    return (long)(p - s);
+    return (long long)(p - s);
 }
 
 /* 把字节偏移换算成字符下标（供 查找 返回字符位置） */
-static long utf8_char_index(const char *s, long byte_off) {
-    long n = 0;
+static long long utf8_char_index(const char *s, long long byte_off) {
+    long long n = 0;
     for (const char *p = s; *p && (p - s) < byte_off; ) { p += utf8_seq_len((unsigned char)*p); n++; }
     return n;
 }
 
 /* 取第 ci 个字符，返回新分配的字符串；越界返回 NULL */
-static char *utf8_char_at(const char *s, long ci) {
-    long off = utf8_byte_offset(s, ci);
+static char *utf8_char_at(const char *s, long long ci) {
+    long long off = utf8_byte_offset(s, ci);
     if (off < 0 || !s[off]) return NULL;
     int len = utf8_seq_len((unsigned char)s[off]);
     char *r = malloc(len + 1);
@@ -477,18 +564,18 @@ static char *utf8_char_at(const char *s, long ci) {
 }
 
 /* 按字符截取 [start, start+count)，自动裁剪到合法范围 */
-static char *utf8_substr(const char *s, long start, long count) {
-    long total = utf8_strlen(s);
+static char *utf8_substr(const char *s, long long start, long long count) {
+    long long total = utf8_strlen(s);
     if (start < 0) start += total;            /* 支持负索引 */
     if (start < 0) start = 0;
     if (start > total) start = total;
     if (count < 0) count = 0;
     if (start + count > total) count = total - start;
-    long b0 = utf8_byte_offset(s, start);
-    long b1 = utf8_byte_offset(s, start + count);
+    long long b0 = utf8_byte_offset(s, start);
+    long long b1 = utf8_byte_offset(s, start + count);
     if (b0 < 0) b0 = 0;
-    if (b1 < 0) b1 = (long)strlen(s);
-    long nb = b1 - b0;
+    if (b1 < 0) b1 = (long long)strlen(s);
+    long long nb = b1 - b0;
     char *r = malloc(nb + 1);
     memcpy(r, s + b0, nb);
     r[nb] = '\0';
@@ -550,7 +637,7 @@ static void val_to_sbuf(Value *v, SBuf *sb) {
     switch (v->type) {
         case VAL_NULL:  sb_append(sb, "空"); break;
         case VAL_BOOL:  sb_append(sb, v->ival ? "真" : "假"); break;
-        case VAL_INT:   sb_appendf(sb, "%ld", v->ival); break;
+        case VAL_INT:   sb_appendf(sb, "%lld", v->ival); break;
         case VAL_FLOAT: sb_appendf(sb, "%g", v->fval); break;
         case VAL_STRING: sb_append(sb, v->sval ? v->sval : ""); break;
         case VAL_LIST:
@@ -921,10 +1008,10 @@ typedef enum {
     TK_TYPE_NUM, TK_TYPE_FUNC, TK_TYPE_ANY,
     TK_CONCUR, TK_WAIT,  /* 并发原语：并发 / 等待 */
     TK_TRY, TK_CATCH, TK_FINALLY, TK_THROW  /* 异常：尝试 / 捕获 / 最终 / 抛出 */
-} TokenType;
+} CoTokenType;
 
 typedef struct {
-    TokenType type;
+    CoTokenType type;
     char      text[MAX_ID_LEN];
     int       line;
     int       col;
@@ -963,8 +1050,8 @@ static void skip_whitespace() {
                 }
             }
         }
-        /* 跳过空白 */
-        if (src[src_pos] == ' ' || src[src_pos] == '\t') {
+        /* 跳过空白（\r 让 CRLF 换行的源码可直接运行，\r 本身不参与语句界定） */
+        if (src[src_pos] == ' ' || src[src_pos] == '\t' || src[src_pos] == '\r') {
             src_pos++;
             src_col++;
             continue;
@@ -975,7 +1062,10 @@ static void skip_whitespace() {
             if (g_bracket_depth > 0) { src_line++; src_col = 1; src_pos++; continue; }
             break;
         }
-        /* 行尾反斜杠：显式续行 */
+        /* 行尾反斜杠：显式续行（同时兼容 \r\n 行尾） */
+        if (src[src_pos] == '\\' && src[src_pos+1] == '\r' && src[src_pos+2] == '\n') {
+            src_pos += 3; src_line++; src_col = 1; continue;
+        }
         if (src[src_pos] == '\\' && src[src_pos+1] == '\n') {
             src_pos += 2; src_line++; src_col = 1; continue;
         }
@@ -1307,8 +1397,8 @@ static void process_escape(char *dest, const char *src, int len) {
 
 
 /* token 的人话名字：报错里出现裸枚举号（"期望 26"）等于没有报错信息，
-   使用者无从下手。表的下标必须与 TokenType 声明顺序严格一致。 */
-static const char *tok_name(TokenType t) {
+   使用者无从下手。表的下标必须与 CoTokenType 声明顺序严格一致。 */
+static const char *tok_name(CoTokenType t) {
     static const char *names[] = {
         "文件结束", "标识符", "整数字面量", "浮点字面量", "字符串", "多行字符串",
         "'+'", "'-'", "'*'", "'/'", "'//'", "'%'",
@@ -1332,7 +1422,7 @@ static const char *tok_name(TokenType t) {
     return names[t];
 }
 
-static void expect(TokenType t) {
+static void expect(CoTokenType t) {
     if (cur_tok.type != t) {
         /* 换行的 text 是真正的 '\n'，直接打进错误里会把提示折断 */
         const char *got = (cur_tok.type == TOK_NEWLINE) ? "换行"
@@ -1953,7 +2043,7 @@ static Node *parse_expression() {
 }
 
 /* 将类型 token 转换为类型标注字符串（用于类型系统） */
-static const char *type_token_name(TokenType t) {
+static const char *type_token_name(CoTokenType t) {
     switch (t) {
         case TK_TYPE_INT:    return "整数";
         case TK_TYPE_FLOAT:  return "浮点";
@@ -2177,7 +2267,7 @@ static Node *parse_while() {
 }
 
 /* 收集语句直到遇到给定的三个终止 token 之一（不消费终止符） */
-static Node **parse_block_until(TokenType a, TokenType b, TokenType c, int *out_cnt) {
+static Node **parse_block_until(CoTokenType a, CoTokenType b, CoTokenType c, int *out_cnt) {
     Node **body = NULL; int bcnt = 0, bcap = 0;
     while (cur_tok.type != a && cur_tok.type != b && cur_tok.type != c &&
            cur_tok.type != TOK_EOF) {
@@ -2464,7 +2554,7 @@ static const char *err_field_str(Value *e, const char *key, const char *dflt) {
     Value *v = dict_get(e->mval, key);
     return (v && v->type == VAL_STRING && v->sval) ? v->sval : dflt;
 }
-static long err_field_int(Value *e, const char *key) {
+static long long err_field_int(Value *e, const char *key) {
     if (!e || e->type != VAL_MAP) return 0;
     Value *v = dict_get(e->mval, key);
     return (v && v->type == VAL_INT) ? v->ival : 0;
@@ -2474,8 +2564,8 @@ static long err_field_int(Value *e, const char *key) {
 static void die_uncaught(Value *err) {
     const char *kind = err_field_str(err, "类型", "运行时错误");
     const char *msg  = err_field_str(err, "消息", "未知错误");
-    long line = err_field_int(err, "行"), col = err_field_int(err, "列");
-    if (line > 0) fprintf(stderr, "%s (第%ld行,%ld列): %s\n", kind, line, col, msg);
+    long long line = err_field_int(err, "行"), col = err_field_int(err, "列");
+    if (line > 0) fprintf(stderr, "%s (第%lld行,%lld列): %s\n", kind, line, col, msg);
     else          fprintf(stderr, "%s: %s\n", kind, msg);
     exit(1);
 }
@@ -2565,8 +2655,8 @@ static Value *builtin_int(int argc, Value **argv) {
     switch (v->type) {
         case VAL_INT: r->ival = v->ival; break;
         case VAL_BOOL: r->ival = v->ival ? 1 : 0; break;
-        case VAL_FLOAT: r->ival = (long)v->fval; break;
-        case VAL_STRING: r->ival = atol(v->sval); break;
+        case VAL_FLOAT: r->ival = (long long)v->fval; break;
+        case VAL_STRING: r->ival = strtoll(v->sval, NULL, 10); break;
         default: r->ival = 0; break;
     }
     return r;
@@ -2685,11 +2775,11 @@ static double num_of(Value *v, const char *who) {
 }
 
 /* 取整数（向零截断）。用于下标、次数、维度之外的整数场合。 */
-static long int_of(Value *v, const char *who) {
+static long long int_of(Value *v, const char *who) {
     double d = num_of(v, who);
     if (d != d) runtime_error(NULL, "%s 收到非法数字 (NaN)", who);
     if (d > 9.2e18 || d < -9.2e18) runtime_error(NULL, "%s 的整数值超出范围", who);
-    return (long)d;
+    return (long long)d;
 }
 
 /* 取「维度」：必须是正整数且不得大到能撑爆内存。
@@ -2697,9 +2787,9 @@ static long int_of(Value *v, const char *who) {
    calloc 一个巨大无符号数，属于典型的内存安全漏洞。 */
 #define CO_MAX_DIM_SIZE 100000000L   /* 单维长度上限 1 亿，防止形状溢出 */
 static int dim_of(Value *v, const char *who) {
-    long d = int_of(v, who);
-    if (d <= 0)          runtime_error(NULL, "%s 的维度必须是正整数，收到 %ld", who, d);
-    if (d > CO_MAX_DIM_SIZE) runtime_error(NULL, "%s 的维度过大：%ld（上限 %ld）", who, d, CO_MAX_DIM_SIZE);
+    long long d = int_of(v, who);
+    if (d <= 0)          runtime_error(NULL, "%s 的维度必须是正整数，收到 %lld", who, d);
+    if (d > CO_MAX_DIM_SIZE) runtime_error(NULL, "%s 的维度过大：%lld（上限 %lld）", who, d, CO_MAX_DIM_SIZE);
     return (int)d;
 }
 
@@ -2718,7 +2808,7 @@ static int truthy(Value *v) {
         default:         return 1;
     }
 }
-static Value *val_int(long x)   { Value *r = val_new(VAL_INT);   r->ival = x; return r; }
+static Value *val_int(long long x)   { Value *r = val_new(VAL_INT);   r->ival = x; return r; }
 static Value *val_flt(double x) { Value *r = val_new(VAL_FLOAT); r->fval = x; return r; }
 static Value *val_bool(int b)   { Value *r = val_new(VAL_BOOL);  r->ival = b ? 1 : 0; return r; }
 
@@ -2726,22 +2816,22 @@ static Value *val_bool(int b)   { Value *r = val_new(VAL_BOOL);  r->ival = b ? 1
 static Value *builtin_round(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "取整函数需要1个参数");
     if (argv[0]->type == VAL_INT) return val_int(argv[0]->ival);
-    return val_int((long)llround(num_of(argv[0], "取整")));
+    return val_int((long long)llround(num_of(argv[0], "取整")));
 }
 static Value *builtin_floor(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "向下取整函数需要1个参数");
     if (argv[0]->type == VAL_INT) return val_int(argv[0]->ival);
-    return val_int((long)floor(num_of(argv[0], "向下取整")));
+    return val_int((long long)floor(num_of(argv[0], "向下取整")));
 }
 static Value *builtin_ceil(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "向上取整函数需要1个参数");
     if (argv[0]->type == VAL_INT) return val_int(argv[0]->ival);
-    return val_int((long)ceil(num_of(argv[0], "向上取整")));
+    return val_int((long long)ceil(num_of(argv[0], "向上取整")));
 }
 static Value *builtin_trunc(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "截断函数需要1个参数");
     if (argv[0]->type == VAL_INT) return val_int(argv[0]->ival);
-    return val_int((long)trunc(num_of(argv[0], "截断")));
+    return val_int((long long)trunc(num_of(argv[0], "截断")));
 }
 
 /* 最大值/最小值：支持多参数，也支持单个列表；全整数则返回整数 */
@@ -2762,7 +2852,7 @@ static Value *builtin_minmax(int argc, Value **argv, int want_max) {
         if (items[i]->type != VAL_INT) all_int = 0;
         if (want_max ? (v > m) : (v < m)) m = v;
     }
-    return all_int ? val_int((long)m) : val_flt(m);
+    return all_int ? val_int((long long)m) : val_flt(m);
 }
 static Value *builtin_max(int argc, Value **argv) { return builtin_minmax(argc, argv, 1); }
 static Value *builtin_min(int argc, Value **argv) { return builtin_minmax(argc, argv, 0); }
@@ -2774,7 +2864,7 @@ static Value *builtin_pow(int argc, Value **argv) {
     double r = pow(b, e);
     /* 整数底 + 非负整数指数 且结果可精确表示 -> 返回整数 */
     if (argv[0]->type == VAL_INT && argv[1]->type == VAL_INT && argv[1]->ival >= 0 &&
-        fabs(r) < 9.0e15) return val_int((long)llround(r));
+        fabs(r) < 9.0e15) return val_int((long long)llround(r));
     return val_flt(r);
 }
 static Value *builtin_sin(int argc, Value **argv) {
@@ -2820,8 +2910,8 @@ static Value *bit_format(int argc, Value **argv, int base, const char *who, cons
     unsigned long long u = (unsigned long long)argv[0]->ival;
     int width = 0;
     if (argc == 2) {
-        long w = int_of(argv[1], who);
-        if (w < 0 || w > 64) runtime_error(NULL, "%s函数的最小宽度须在 0~64 之间，收到 %ld", who, w);
+        long long w = int_of(argv[1], who);
+        if (w < 0 || w > 64) runtime_error(NULL, "%s函数的最小宽度须在 0~64 之间，收到 %lld", who, w);
         width = (int)w;
     }
     char digits[65]; int dn = 0;
@@ -2857,10 +2947,10 @@ static Value *builtin_getbit(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "取位函数需要2个参数（值, 位号）");
     if (!(argv[0]->type == VAL_INT || argv[0]->type == VAL_BOOL))
         runtime_error(NULL, "取位函数需要整数，收到 %s", val_type_name(argv[0]));
-    long b = int_of(argv[1], "取位");
-    if (b < 0 || b > 63) runtime_error(NULL, "位号须在 0~63 之间，收到 %ld", b);
+    long long b = int_of(argv[1], "取位");
+    if (b < 0 || b > 63) runtime_error(NULL, "位号须在 0~63 之间，收到 %lld", b);
     unsigned long long u = (unsigned long long)argv[0]->ival;
-    return val_int((long)((u >> b) & 1ULL));
+    return val_int((long long)((u >> b) & 1ULL));
 }
 
 /* 置位：置位(值, 位号, 0或1) → 新值（不改原值） */
@@ -2868,21 +2958,21 @@ static Value *builtin_setbit(int argc, Value **argv) {
     if (argc != 3) runtime_error(NULL, "置位函数需要3个参数（值, 位号, 0或1）");
     if (!(argv[0]->type == VAL_INT || argv[0]->type == VAL_BOOL))
         runtime_error(NULL, "置位函数需要整数，收到 %s", val_type_name(argv[0]));
-    long b = int_of(argv[1], "置位");
-    if (b < 0 || b > 63) runtime_error(NULL, "位号须在 0~63 之间，收到 %ld", b);
-    long bit = int_of(argv[2], "置位");
-    if (bit != 0 && bit != 1) runtime_error(NULL, "置位的目标值只能是 0 或 1，收到 %ld", bit);
+    long long b = int_of(argv[1], "置位");
+    if (b < 0 || b > 63) runtime_error(NULL, "位号须在 0~63 之间，收到 %lld", b);
+    long long bit = int_of(argv[2], "置位");
+    if (bit != 0 && bit != 1) runtime_error(NULL, "置位的目标值只能是 0 或 1，收到 %lld", bit);
     unsigned long long u = (unsigned long long)argv[0]->ival;
     u = bit ? (u | (1ULL << b)) : (u & ~(1ULL << b));
-    return val_int((long)u);
+    return val_int((long long)u);
 }
 /* 随机整数：随机整数(a, b) 返回 [a, b] 闭区间内均匀整数 */
 static Value *builtin_rand_int(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "随机整数函数需要2个参数");
-    long a = (long)num_of(argv[0], "随机整数"), b = (long)num_of(argv[1], "随机整数");
-    if (a > b) { long t = a; a = b; b = t; }
-    long span = b - a + 1;
-    return val_int(a + (long)((double)rand() / ((double)RAND_MAX + 1.0) * (double)span));
+    long long a = (long long)num_of(argv[0], "随机整数"), b = (long long)num_of(argv[1], "随机整数");
+    if (a > b) { long long t = a; a = b; b = t; }
+    long long span = b - a + 1;
+    return val_int(a + (long long)((double)rand() / ((double)RAND_MAX + 1.0) * (double)span));
 }
 
 /* 列表函数 */
@@ -2902,12 +2992,12 @@ static Value *builtin_remove(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "删除函数需要2个参数");
     if (argv[0]->type != VAL_LIST) runtime_error(NULL, "删除函数的第一个参数必须是列表");
     Value *list = argv[0];
-    long i0 = (long)num_of(argv[1], "删除"), idx = i0;
+    long long i0 = (long long)num_of(argv[1], "删除"), idx = i0;
     if (idx < 0) idx += list->list_len;   /* 负索引：-1 表示最后一个，与索引/切片/插入一致 */
     if (idx < 0 || idx >= list->list_len)
-        runtime_error(NULL, "列表索引越界: %ld（列表长度 %d）", i0, list->list_len);
+        runtime_error(NULL, "列表索引越界: %lld（列表长度 %d）", i0, list->list_len);
     val_free(list->lval[idx]);
-    for (long i = idx; i < list->list_len - 1; i++) {
+    for (long long i = idx; i < list->list_len - 1; i++) {
         list->lval[i] = list->lval[i + 1];
     }
     list->list_len--;
@@ -3030,17 +3120,17 @@ static void list_push(Value *list, Value *item /* 借用，内部 retain */) {
 /* 范围(n) -> [0..n-1]；范围(a,b) -> [a..b-1]；范围(a,b,步长) */
 static Value *builtin_range(int argc, Value **argv) {
     if (argc < 1 || argc > 3) runtime_error(NULL, "范围函数需要1-3个参数");
-    long a = 0, b = 0, s = 1;
-    if (argc == 1) { b = (long)num_of(argv[0], "范围"); }
+    long long a = 0, b = 0, s = 1;
+    if (argc == 1) { b = (long long)num_of(argv[0], "范围"); }
     else {
-        a = (long)num_of(argv[0], "范围");
-        b = (long)num_of(argv[1], "范围");
-        if (argc == 3) s = (long)num_of(argv[2], "范围");
+        a = (long long)num_of(argv[0], "范围");
+        b = (long long)num_of(argv[1], "范围");
+        if (argc == 3) s = (long long)num_of(argv[2], "范围");
     }
     if (s == 0) runtime_error(NULL, "范围的步长不能为 0");
     Value *r = list_new_empty();
-    if (s > 0) for (long i = a; i < b; i += s) { Value *v = val_int(i); list_push(r, v); val_free(v); }
-    else       for (long i = a; i > b; i += s) { Value *v = val_int(i); list_push(r, v); val_free(v); }
+    if (s > 0) for (long long i = a; i < b; i += s) { Value *v = val_int(i); list_push(r, v); val_free(v); }
+    else       for (long long i = a; i > b; i += s) { Value *v = val_int(i); list_push(r, v); val_free(v); }
     return r;
 }
 
@@ -3049,9 +3139,9 @@ static Value *builtin_reverse(int argc, Value **argv) {
     if (argv[0]->type == VAL_STRING) {
         /* 按字符反转（UTF-8 安全） */
         const char *s = argv[0]->sval ? argv[0]->sval : "";
-        long n = utf8_strlen(s);
+        long long n = utf8_strlen(s);
         SBuf sb; sb_init(&sb);
-        for (long i = n - 1; i >= 0; i--) {
+        for (long long i = n - 1; i >= 0; i--) {
             char *ch = utf8_char_at(s, i);
             sb_append(&sb, ch);
             free(ch);
@@ -3082,14 +3172,14 @@ static Value *builtin_insert(int argc, Value **argv) {
     if (argc != 3) runtime_error(NULL, "插入函数需要3个参数");
     if (argv[0]->type != VAL_LIST) runtime_error(NULL, "插入函数的第一个参数必须是列表");
     Value *l = argv[0];
-    long idx = (long)num_of(argv[1], "插入");
+    long long idx = (long long)num_of(argv[1], "插入");
     if (idx < 0) idx += l->list_len;
     if (idx < 0) idx = 0;
     if (idx > l->list_len) idx = l->list_len;
     Value **nl = realloc(l->lval, (l->list_len + 1) * sizeof(Value*));
     if (!nl) runtime_error(NULL, "插入时内存不足");
     l->lval = nl;
-    for (long i = l->list_len; i > idx; i--) l->lval[i] = l->lval[i-1];
+    for (long long i = l->list_len; i > idx; i--) l->lval[i] = l->lval[i-1];
     l->lval[idx] = val_retain_root(argv[2]);
     l->list_len++;
     return val_retain(l);
@@ -3101,11 +3191,11 @@ static Value *builtin_pop(int argc, Value **argv) {
     if (argv[0]->type != VAL_LIST) runtime_error(NULL, "弹出函数的第一个参数必须是列表");
     Value *l = argv[0];
     if (l->list_len == 0) runtime_error(NULL, "无法从空列表弹出元素");
-    long idx = (argc == 2) ? (long)num_of(argv[1], "弹出") : l->list_len - 1;
+    long long idx = (argc == 2) ? (long long)num_of(argv[1], "弹出") : l->list_len - 1;
     if (idx < 0) idx += l->list_len;
     if (idx < 0 || idx >= l->list_len) runtime_error(NULL, "弹出的下标越界");
     Value *out = l->lval[idx];              /* 引用移交给调用方，不再 retain */
-    for (long i = idx; i < l->list_len - 1; i++) l->lval[i] = l->lval[i+1];
+    for (long long i = idx; i < l->list_len - 1; i++) l->lval[i] = l->lval[i+1];
     l->list_len--;
     return out;
 }
@@ -3132,13 +3222,13 @@ static Value *builtin_count(int argc, Value **argv) {
         const char *s = argv[0]->sval ? argv[0]->sval : "";
         const char *t = argv[1]->sval ? argv[1]->sval : "";
         if (!*t) runtime_error(NULL, "计数的目标不能是空字符串");
-        long c = 0;
+        long long c = 0;
         size_t tl = strlen(t);
         for (const char *p = s; (p = strstr(p, t)) != NULL; p += tl) c++;
         return val_int(c);
     }
     if (argv[0]->type != VAL_LIST) runtime_error(NULL, "计数函数的第一个参数必须是列表或字符串");
-    long c = 0;
+    long long c = 0;
     for (int i = 0; i < argv[0]->list_len; i++)
         if (val_equals(argv[0]->lval[i], argv[1])) c++;
     return val_int(c);
@@ -3149,9 +3239,9 @@ static Value *builtin_slice(int argc, Value **argv) {
     if (argc < 2 || argc > 3) runtime_error(NULL, "切片函数需要2-3个参数");
     if (argv[0]->type == VAL_STRING) {
         const char *s = argv[0]->sval ? argv[0]->sval : "";
-        long n = utf8_strlen(s);
-        long a = (long)num_of(argv[1], "切片");
-        long b = (argc == 3) ? (long)num_of(argv[2], "切片") : n;
+        long long n = utf8_strlen(s);
+        long long a = (long long)num_of(argv[1], "切片");
+        long long b = (argc == 3) ? (long long)num_of(argv[2], "切片") : n;
         if (a < 0) a += n;
         if (b < 0) b += n;
         if (a < 0) a = 0;
@@ -3162,15 +3252,15 @@ static Value *builtin_slice(int argc, Value **argv) {
     }
     if (argv[0]->type != VAL_LIST) runtime_error(NULL, "切片函数的第一个参数必须是列表或字符串");
     Value *l = argv[0];
-    long n = l->list_len;
-    long a = (long)num_of(argv[1], "切片");
-    long b = (argc == 3) ? (long)num_of(argv[2], "切片") : n;
+    long long n = l->list_len;
+    long long a = (long long)num_of(argv[1], "切片");
+    long long b = (argc == 3) ? (long long)num_of(argv[2], "切片") : n;
     if (a < 0) a += n;
     if (b < 0) b += n;
     if (a < 0) a = 0;
     if (b > n) b = n;
     Value *r = list_new_empty();
-    for (long i = a; i < b; i++) list_push(r, l->lval[i]);
+    for (long long i = a; i < b; i++) list_push(r, l->lval[i]);
     return r;
 }
 
@@ -3196,7 +3286,7 @@ static Value *builtin_total(int argc, Value **argv) {
         s += num_of(argv[0]->lval[i], "累加");
         if (argv[0]->lval[i]->type != VAL_INT) all_int = 0;
     }
-    return all_int ? val_int((long)s) : val_flt(s);
+    return all_int ? val_int((long long)s) : val_flt(s);
 }
 
 /* ---------- 字典函数 ---------- */
@@ -3360,8 +3450,8 @@ static Value *builtin_split(int argc, Value **argv) {
     size_t sl = strlen(sep);
     if (sl == 0) {
         /* 空分隔符：逐字符拆分（UTF-8 安全） */
-        long n = utf8_strlen(s);
-        for (long i = 0; i < n; i++) {
+        long long n = utf8_strlen(s);
+        for (long long i = 0; i < n; i++) {
             Value *e = val_new(VAL_STRING);
             e->sval = utf8_char_at(s, i);
             list_push(result, e);
@@ -3440,7 +3530,7 @@ static Value *builtin_find(int argc, Value **argv) {
     Value *result = val_new(VAL_INT);
     char *p = strstr(argv[0]->sval, argv[1]->sval);
     /* 返回字符下标而非字节偏移，与 长度/截取/下标 保持同一坐标系 */
-    result->ival = p ? utf8_char_index(argv[0]->sval, (long)(p - argv[0]->sval)) : -1;
+    result->ival = p ? utf8_char_index(argv[0]->sval, (long long)(p - argv[0]->sval)) : -1;
     return result;
 }
 
@@ -3510,10 +3600,10 @@ static Value *builtin_lower(int argc, Value **argv) {
 static Value *builtin_repeat(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "重复函数需要2个参数");
     const char *s = str_arg(argv[0], "重复");
-    long n = (long)num_of(argv[1], "重复");
+    long long n = (long long)num_of(argv[1], "重复");
     if (n < 0) runtime_error(NULL, "重复次数不能为负数");
     SBuf sb; sb_init(&sb);
-    for (long i = 0; i < n; i++) sb_append(&sb, s);
+    for (long long i = 0; i < n; i++) sb_append(&sb, s);
     Value *r = val_new(VAL_STRING);
     r->sval = sb.buf;
     return r;
@@ -3536,23 +3626,23 @@ static Value *builtin_endswith(int argc, Value **argv) {
 static Value *builtin_char_code(int argc, Value **argv) {
     if (argc < 1 || argc > 2) runtime_error(NULL, "字符码函数需要1-2个参数");
     const char *s = str_arg(argv[0], "字符码");
-    long idx = (argc == 2) ? (long)num_of(argv[1], "字符码") : 0;
+    long long idx = (argc == 2) ? (long long)num_of(argv[1], "字符码") : 0;
     char *ch = utf8_char_at(s, idx);
     if (!ch) runtime_error(NULL, "字符码的下标越界");
     unsigned char c0 = (unsigned char)ch[0];
-    long cp;
+    long long cp;
     int n = utf8_seq_len(c0);
     if (n == 1) cp = c0;
     else if (n == 2) cp = ((c0 & 0x1F) << 6) | ((unsigned char)ch[1] & 0x3F);
     else if (n == 3) cp = ((c0 & 0x0F) << 12) | (((unsigned char)ch[1] & 0x3F) << 6) | ((unsigned char)ch[2] & 0x3F);
-    else cp = ((long)(c0 & 0x07) << 18) | (((unsigned char)ch[1] & 0x3F) << 12) |
+    else cp = ((long long)(c0 & 0x07) << 18) | (((unsigned char)ch[1] & 0x3F) << 12) |
               (((unsigned char)ch[2] & 0x3F) << 6) | ((unsigned char)ch[3] & 0x3F);
     free(ch);
     return val_int(cp);
 }
 static Value *builtin_from_code(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "码转字符函数需要1个参数");
-    long cp = (long)num_of(argv[0], "码转字符");
+    long long cp = (long long)num_of(argv[0], "码转字符");
     if (cp < 0 || cp > 0x10FFFF) runtime_error(NULL, "码点超出 Unicode 范围");
     char b[5]; int n;
     if (cp < 0x80)        { b[0] = (char)cp; n = 1; }
@@ -3574,26 +3664,26 @@ static Value *builtin_from_code(int argc, Value **argv) {
 static Value *builtin_byte_len(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "字节数函数需要1个参数");
     const char *s = str_arg(argv[0], "字节数");
-    return val_int((long)strlen(s));
+    return val_int((long long)strlen(s));
 }
 
 static Value *builtin_byte_at(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "字节函数需要2个参数（文本, 下标）");
     const char *s = str_arg(argv[0], "字节");
-    long n = (long)strlen(s);
-    long i = int_of(argv[1], "字节");
+    long long n = (long long)strlen(s);
+    long long i = int_of(argv[1], "字节");
     if (i < 0) i += n;                       /* 负下标：-1 表示最后一个字节 */
-    if (i < 0 || i >= n) runtime_error(NULL, "字节下标越界: %ld（共 %ld 字节）", i, n);
-    return val_int((long)(unsigned char)s[i]);
+    if (i < 0 || i >= n) runtime_error(NULL, "字节下标越界: %lld（共 %lld 字节）", i, n);
+    return val_int((long long)(unsigned char)s[i]);
 }
 
 static Value *builtin_bytes_of(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "字节列表函数需要1个参数");
     const char *s = str_arg(argv[0], "字节列表");
-    long n = (long)strlen(s);
+    long long n = (long long)strlen(s);
     Value *lst = list_new_empty();
-    for (long i = 0; i < n; i++) {
-        Value *b = val_int((long)(unsigned char)s[i]);
+    for (long long i = 0; i < n; i++) {
+        Value *b = val_int((long long)(unsigned char)s[i]);
         list_push(lst, b);
         val_free(b);                          /* list_push 内部已 retain */
     }
@@ -3607,8 +3697,8 @@ static Value *builtin_bytes_to_str(int argc, Value **argv) {
     /* 用异常安全的临时缓冲：中途遇到非法字节会 longjmp，普通 malloc 会泄漏 */
     char *buf = (char *)co_tmp_alloc((size_t)n + 1);
     for (int i = 0; i < n; i++) {
-        long b = int_of(argv[0]->lval[i], "字节转文本");
-        if (b < 0 || b > 255) runtime_error(NULL, "字节值须在 0~255 之间，第 %d 项是 %ld", i, b);
+        long long b = int_of(argv[0]->lval[i], "字节转文本");
+        if (b < 0 || b > 255) runtime_error(NULL, "字节值须在 0~255 之间，第 %d 项是 %lld", i, b);
         if (b == 0) runtime_error(NULL, "字节值不能是 0（字符串以 0 结尾，会被截断）");
         buf[i] = (char)(unsigned char)b;
     }
@@ -3626,7 +3716,7 @@ static Value *builtin_read_file(int argc, Value **argv) {
     FILE *f = fopen(path, "rb");
     if (!f) runtime_error(NULL, "无法打开文件: %s", path);
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); runtime_error(NULL, "无法定位文件末尾: %s", path); }
-    long sz = ftell(f);
+    long long sz = ftell(f);
     if (sz < 0) { fclose(f); runtime_error(NULL, "无法获取文件大小: %s", path); }
     rewind(f);
     char *buf = malloc((size_t)sz + 1);
@@ -3642,14 +3732,14 @@ static Value *file_write_impl(int argc, Value **argv, const char *mode, const ch
     if (argc != 2) runtime_error(NULL, "%s函数需要2个参数（路径, 内容）", who);
     const char *path = str_arg(argv[0], who);
     char *content = val_to_string(argv[1]);
-    FILE *f = fopen(path, mode);
+    FILE *f = fopen(path, mode);   /* 调用方传 wb/ab：二进制模式，Windows 不篡改字节流 */
     if (!f) { free(content); runtime_error(NULL, "无法写入文件: %s", path); }
     size_t n = strlen(content);
     size_t w = fwrite(content, 1, n, f);
     int cerr = fclose(f);
     free(content);
     if (w != n || cerr != 0) runtime_error(NULL, "写入文件未完成: %s", path);
-    return val_int((long)n);
+    return val_int((long long)n);
 }
 static Value *builtin_write_file(int argc, Value **argv)  { return file_write_impl(argc, argv, "wb", "写文件"); }
 static Value *builtin_append_file(int argc, Value **argv) { return file_write_impl(argc, argv, "ab", "追加文件"); }
@@ -4201,8 +4291,8 @@ static Value *builtin_zeros(int argc, Value **argv) {
     if (argc != 1 || argv[0]->type != VAL_LIST) runtime_error(NULL, "全零函数需要形状列表");
     int ndim = argv[0]->list_len;
     if (ndim < 1 || ndim > CO_MAX_DIM) runtime_error(NULL, "形状维数必须在 1..%d 之间，收到 %d", CO_MAX_DIM, ndim);
-    int sh[CO_MAX_DIM]; int size = 1;   /* 栈数组：异常 longjmp 时不会漏 */
-    for (int i = 0; i < ndim; i++) { sh[i] = dim_of(argv[0]->lval[i], "形状列表"); size *= sh[i]; }
+    int sh[CO_MAX_DIM];                 /* 栈数组：异常 longjmp 时不会漏 */
+    for (int i = 0; i < ndim; i++) sh[i] = dim_of(argv[0]->lval[i], "形状列表");
     Tensor *c = tensor_new(ndim, sh);
     Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
 }
@@ -4362,20 +4452,20 @@ static Value *builtin_optim(int argc, Value **argv) {
    原先 取/置 直接用 t->data[i] 而不检查 i，负索引或超界会
    越界读写堆内存——是可被利用的内存安全漏洞，不只是"结果错"。 */
 static int tensor_linear(Tensor *t, Value *iv, const char *who) {
-    long i = int_of(iv, who);
+    long long i = int_of(iv, who);
     if (i < 0) i += t->size;                       /* 支持负索引 */
     if (i < 0 || i >= t->size)
-        runtime_error(NULL, "%s 的索引越界：%ld（共 %d 个元素）", who, i, t->size);
+        runtime_error(NULL, "%s 的索引越界：%lld（共 %d 个元素）", who, i, t->size);
     return (int)i;
 }
 static int tensor_offset_2d(Tensor *t, Value *rv, Value *cv, const char *who) {
-    long rows = t->shape[0], cols = t->shape[1];
-    long i = int_of(rv, who);
-    long j = cv ? int_of(cv, who) : 0;
+    long long rows = t->shape[0], cols = t->shape[1];
+    long long i = int_of(rv, who);
+    long long j = cv ? int_of(cv, who) : 0;
     if (i < 0) i += rows;
     if (j < 0) j += cols;
-    if (i < 0 || i >= rows) runtime_error(NULL, "%s 的行索引越界：%ld（共 %ld 行）", who, i, rows);
-    if (j < 0 || j >= cols) runtime_error(NULL, "%s 的列索引越界：%ld（共 %ld 列）", who, j, cols);
+    if (i < 0 || i >= rows) runtime_error(NULL, "%s 的行索引越界：%lld（共 %lld 行）", who, i, rows);
+    if (j < 0 || j >= cols) runtime_error(NULL, "%s 的列索引越界：%lld（共 %lld 列）", who, j, cols);
     return (int)(i * cols + j);
 }
 static Value *builtin_get(int argc, Value **argv) {
@@ -4673,6 +4763,27 @@ static void env_release(Env *e) {
 static __thread char *g_stack_redline = NULL;   /* 帧地址触到这里即判定「快见底」 */
 
 static void stack_guard_init(size_t hint) {
+#ifdef _WIN32
+    /* Windows：VirtualQuery 本线程栈，拿真实栈区间（与 pthread_attr_getstack 同语义：
+       lo = 栈最低地址，sz = 栈总大小）。栈向下生长，已提交区间的顶端即栈顶。 */
+    void  *lo = NULL;
+    size_t sz = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(__builtin_frame_address(0), &mbi, sizeof mbi) && mbi.AllocationBase) {
+        lo = (void *)mbi.AllocationBase;
+        sz = (size_t)((char *)mbi.BaseAddress + mbi.RegionSize - (char *)mbi.AllocationBase);
+    }
+    if (lo && sz > (1u << 20)) {
+        /* 预留 1/8（至少 1 MB）：报错路径本身也要栈。 */
+        size_t reserve = sz / 8;
+        if (reserve < (1u << 20)) reserve = 1u << 20;
+        g_stack_redline = (char *)lo + reserve;
+    } else {
+        /* 退化路径：以当前帧为基准估算可用额度（Windows 没有 getrlimit 可问） */
+        size_t total = hint ? hint : (8u << 20);
+        g_stack_redline = (char *)__builtin_frame_address(0) - (total - total / 4);
+    }
+#else
     void  *lo = NULL;
     size_t sz = 0;
     pthread_attr_t at;
@@ -4695,6 +4806,7 @@ static void stack_guard_init(size_t hint) {
             total = (size_t)rl.rlim_cur;
         g_stack_redline = (char *)__builtin_frame_address(0) - (total - total / 4);
     }
+#endif
 }
 
 /* 递归深度上限：仅作为「明显失控」的第二道防线，真正把关的是栈红线。
@@ -4774,7 +4886,7 @@ static Value *eval_node(Node *n, Env *env) {
         case ND_LITERAL: {
             Value *v = val_new(n->literal.lit_type);
             switch (n->literal.lit_type) {
-                case VAL_INT: v->ival = atol(n->literal.value); break;
+                case VAL_INT: v->ival = strtoll(n->literal.value, NULL, 10); break;
                 case VAL_BOOL: v->ival = (n->literal.value[0] == '1'); break;
                 case VAL_FLOAT: v->fval = atof(n->literal.value); break;
                 case VAL_STRING: v->sval = strdup(n->literal.value); break;
@@ -4804,10 +4916,10 @@ static Value *eval_node(Node *n, Env *env) {
                 } else if (l->type == VAL_STRING) {
                     int i = (int)idx_val(idx);
                     /* 按【字符】取值：支持负索引，取出完整 UTF-8 序列（不会切碎汉字） */
-                    long slen = utf8_strlen(l->sval);
-                    long ci = i < 0 ? i + slen : i;
+                    long long slen = utf8_strlen(l->sval);
+                    long long ci = i < 0 ? i + slen : i;
                     char *ch = (ci >= 0 && ci < slen) ? utf8_char_at(l->sval, ci) : NULL;
-                    if (!ch) runtime_error(n, "字符串索引越界: %d（长度 %ld）", i, slen);
+                    if (!ch) runtime_error(n, "字符串索引越界: %d（长度 %lld）", i, slen);
                     val_free(idx);
                     Value *r = val_new(VAL_STRING);
                     r->sval = ch;
@@ -4909,17 +5021,17 @@ static Value *eval_node(Node *n, Env *env) {
                         runtime_error(n, "位运算 %s 需要整数，收到 %s %s %s（浮点请先用 取整 转换）",
                                       opbuf, ln, opbuf, rn);
                     }
-                    long a = l->ival, b = r->ival, res = 0;
+                    long long a = l->ival, b = r->ival, res = 0;
                     val_free(l); val_free(r);
                     if (is_shl || is_shr) {
-                        if (b < 0)  runtime_error(n, "移位位数不能为负: %ld", b);
-                        if (b > 63) runtime_error(n, "移位位数超出范围: %ld（0~63）", b);
+                        if (b < 0)  runtime_error(n, "移位位数不能为负: %lld", b);
+                        if (b > 63) runtime_error(n, "移位位数超出范围: %lld（0~63）", b);
                         if (is_shl) {
-                            res = (long)((unsigned long)a << b);
+                            res = (long long)((unsigned long long)a << b);
                         } else {
                             /* 算术右移的可移植写法：负数用补码取反两次实现符号填充 */
-                            res = (a < 0) ? (long)~((~(unsigned long)a) >> b)
-                                          : (long)((unsigned long)a >> b);
+                            res = (a < 0) ? (long long)~((~(unsigned long long)a) >> b)
+                                          : (long long)((unsigned long long)a >> b);
                         }
                     }
                     else if (is_band) res = a & b;
@@ -5003,7 +5115,7 @@ static Value *eval_node(Node *n, Env *env) {
                 return fv;
             } else {
                 Value *iv = val_new(VAL_INT);
-                iv->ival = (long)result;
+                iv->ival = (long long)result;
                 return iv;
             }
         }
@@ -5012,9 +5124,9 @@ static Value *eval_node(Node *n, Env *env) {
             if (strcmp(n->unary.op, "-") == 0) {
                 /* 必须返回【新值】：操作数可能是变量或容器元素的共享引用
                    （eval 返回的是 retain 后的同一对象），原地取负会篡改源数据。 */
-                if (v->type == VAL_INT)   { long x = v->ival; val_free(v); return val_int(-x); }
+                if (v->type == VAL_INT)   { long long x = v->ival; val_free(v); return val_int(-x); }
                 if (v->type == VAL_FLOAT) { double x = v->fval; val_free(v); return val_flt(-x); }
-                if (v->type == VAL_BOOL)  { long x = v->ival; val_free(v); return val_int(-x); }
+                if (v->type == VAL_BOOL)  { long long x = v->ival; val_free(v); return val_int(-x); }
                 if (v->type == VAL_TENSOR) {
                     Tensor *t = v->tval;
                     Tensor *o = tensor_new(t->ndim, t->shape);
@@ -5037,7 +5149,7 @@ static Value *eval_node(Node *n, Env *env) {
             } else if (strcmp(n->unary.op, "~") == 0) {
                 /* 按位取反只对整数有意义；布尔按 0/1 参与，结果是整数（真 → -2） */
                 if (v->type == VAL_INT || v->type == VAL_BOOL) {
-                    long x = v->ival; val_free(v); return val_int(~x);
+                    long long x = v->ival; val_free(v); return val_int(~x);
                 }
                 const char *tn = val_type_name(v);
                 val_free(v);
@@ -5071,8 +5183,8 @@ static Value *eval_node(Node *n, Env *env) {
                     }
                 } else if (src->type == VAL_STRING) {
                     /* 按字符遍历，中文字符串推导式不会产生乱码 */
-                    long slen = utf8_strlen(src->sval);
-                    for (long i = 0; i < slen; i++) {
+                    long long slen = utf8_strlen(src->sval);
+                    for (long long i = 0; i < slen; i++) {
                         Value *ch = val_new(VAL_STRING); ch->sval = utf8_char_at(src->sval, i);
                         env_set(env, iname, ch); val_free(ch);
                         take = 1;
@@ -5143,7 +5255,7 @@ static Value *eval_node(Node *n, Env *env) {
                             Value *k = eval_node(n->map_lit.keys[0], env);
                             Value *v = eval_node(n->map_lit.vals[0], env);
                             if (k->type == VAL_STRING) dict_set(result->mval, k->sval, v);
-                            else { char buf[64]; if(k->type==VAL_INT) snprintf(buf,sizeof(buf),"%ld",k->ival); else snprintf(buf,sizeof(buf),"%g",k->fval); dict_set(result->mval, buf, v); }
+                            else { char buf[64]; if(k->type==VAL_INT) snprintf(buf,sizeof(buf),"%lld",k->ival); else snprintf(buf,sizeof(buf),"%g",k->fval); dict_set(result->mval, buf, v); }
                             val_free(k); val_free(v);
                         }
                     }
@@ -5168,7 +5280,7 @@ static Value *eval_node(Node *n, Env *env) {
                             Value *k = eval_node(n->map_lit.keys[0], env);
                             Value *v = eval_node(n->map_lit.vals[0], env);
                             if (k->type == VAL_STRING) dict_set(result->mval, k->sval, v);
-                            else { char buf[64]; if(k->type==VAL_INT) snprintf(buf,sizeof(buf),"%ld",k->ival); else snprintf(buf,sizeof(buf),"%g",k->fval); dict_set(result->mval, buf, v); }
+                            else { char buf[64]; if(k->type==VAL_INT) snprintf(buf,sizeof(buf),"%lld",k->ival); else snprintf(buf,sizeof(buf),"%g",k->fval); dict_set(result->mval, buf, v); }
                             val_free(k); val_free(v);
                         }
                     }
@@ -5186,7 +5298,7 @@ static Value *eval_node(Node *n, Env *env) {
                     dict_set(map->mval, k->sval, v);
                 } else {
                     char buf[64];
-                    if (k->type == VAL_INT) snprintf(buf, sizeof(buf), "%ld", k->ival);
+                    if (k->type == VAL_INT) snprintf(buf, sizeof(buf), "%lld", k->ival);
                     else snprintf(buf, sizeof(buf), "%g", k->fval);
                     dict_set(map->mval, buf, v);
                 }
@@ -5459,9 +5571,9 @@ static void exec_node(Node *n, Env *env) {
                     i += step;
                 }
             } else {
-                long i = (long)start;
-                long e = (long)end;
-                long s = (long)step;
+                long long i = (long long)start;
+                long long e = (long long)end;
+                long long s = (long long)step;
                 int direction = (s > 0) ? 1 : -1;
                 while ((direction > 0 && i <= e) || (direction < 0 && i >= e)) {
                     Value *iv = val_new(VAL_INT);
@@ -5511,13 +5623,13 @@ static void exec_node(Node *n, Env *env) {
             } else {
                 snprintf(path, sizeof(path), "%s", n->import_stmt.path);
             }
-            FILE *mf = fopen(path, "r");
+            FILE *mf = fopen(path, "rb");
             if (!mf) {
                 fprintf(stderr, "导入错误: 无法打开模块 '%s'\n", path);
                 exit(1);
             }
             if (fseek(mf, 0, SEEK_END) != 0) { fclose(mf); runtime_error(n, "无法读取模块 '%s'", path); }
-            long msize = ftell(mf);
+            long long msize = ftell(mf);
             if (msize < 0) { fclose(mf); runtime_error(n, "无法获取模块大小 '%s'", path); }
             rewind(mf);
             char *mbuf = malloc((size_t)msize + 1);
@@ -5747,7 +5859,7 @@ static char  *ng_resolve(NGen *g, const char *name);
 static char  *ng_local(NGen *g, const char *name);
 static char  *ng_register_func(NGen *g, const char *name, int pcnt);
 static const char *ng_builtin_cname(const char *name);
-static long   ng_parse_int(const char *s, int *ok);
+static long long   ng_parse_int(const char *s, int *ok);
 static void    ng_emit_cstr(NGen *g, const char *s);
 static char  *ng_expr(NGen *g, Node *n);
 static void    ng_expr_call(NGen *g, Node *n, const char *tmp);
@@ -5853,7 +5965,7 @@ static const char *ng_builtin_cname(const char *name) {
 }
 
 /* 解析整数字面量：支持 0x/0b/0o 与 _ 分隔符，溢出报错 */
-static long ng_parse_int(const char *s, int *ok) {
+static long long ng_parse_int(const char *s, int *ok) {
     *ok = 1;
     char buf[128]; int bi = 0;
     for (int i = 0; s[i] && bi < 127; i++) if (s[i] != '_') buf[bi++] = s[i];
@@ -5863,7 +5975,7 @@ static long ng_parse_int(const char *s, int *ok) {
     else if (buf[0] == '0' && (buf[1] == 'b' || buf[1] == 'B')) { base = 2; num = buf + 2; }
     else if (buf[0] == '0' && (buf[1] == 'o' || buf[1] == 'O')) { base = 8; num = buf + 2; }
     errno = 0;
-    char *end; long v = strtoll(num, &end, base);
+    char *end; long long v = strtoll(num, &end, base);
     if (errno == ERANGE || v > 9223372036854775807LL) { *ok = 0; return 0; }
     return v;
 }
@@ -5891,9 +6003,9 @@ static char *ng_expr(NGen *g, Node *n) {
     switch (n->type) {
     case ND_LITERAL: {
         if (n->literal.lit_type == VAL_INT) {
-            int ok; long v = ng_parse_int(n->literal.value, &ok);
+            int ok; long long v = ng_parse_int(n->literal.value, &ok);
             if (!ok) ng_error(g, n, "整数字面量超出范围: %s", n->literal.value);
-            fprintf(g->out, "    CoVal %s = cv_int(%ld);\n", tmp, v);
+            fprintf(g->out, "    CoVal %s = cv_int(%lld);\n", tmp, v);
         } else if (n->literal.lit_type == VAL_FLOAT) {
             char buf[160]; int bi = 0;
             for (int i = 0; n->literal.value[i] && bi < 159; i++)
@@ -5944,9 +6056,9 @@ static char *ng_expr(NGen *g, Node *n) {
                后续 `_aN[i] = tmp;` 会引用到不存在的名字。 */
             fprintf(g->out, "    CoVal %s;\n", tmp);
             fprintf(g->out,
-                "    { CoVal _L = %s, _R = %s; long _idx = cv_num(_R);"
+                "    { CoVal _L = %s, _R = %s; long long _idx = cv_num(_R);"
                 " const char *_cs = (_L.tag == CV_STR ? _L.s : \"\");"
-                " long _sl = cv_utf8_len(_cs); long _ci = (_idx < 0) ? _idx + _sl : _idx;"
+                " long long _sl = cv_utf8_len(_cs); long long _ci = (_idx < 0) ? _idx + _sl : _idx;"
                 " if (_ci < 0 || _ci >= _sl) cv_die(\"字符串索引越界\");"
                 " char _cb[8]; cv_utf8_char(_cs, _ci, _cb);"
                 " %s = cv_str_take(cv_str_dup(_cb)); cv_free(_L); cv_free(_R); }\n",
@@ -6146,7 +6258,7 @@ static void ng_for(NGen *g, Node *n) {
        这正是「嵌套控制流」用例暴露出来的问题。 */
     fprintf(g->out, "      for (; (_dir > 0 && _i <= _ev + 1e-4) || (_dir < 0 && _i >= _ev - 1e-4); _i += _stp) {\n");
     char *lv = ng_local(g, n->for_stmt.var);
-    fprintf(g->out, "        cv_free(%s); %s = _isf ? cv_flt(_i) : cv_int((long)_i);\n", lv, lv);
+    fprintf(g->out, "        cv_free(%s); %s = _isf ? cv_flt(_i) : cv_int((long long)_i);\n", lv, lv);
     for (int i = 0; i < n->for_stmt.bcnt; i++) ng_stmt(g, n->for_stmt.body[i]);
     fprintf(g->out, "      }\n");
     fprintf(g->out, "    }\n");
@@ -6236,9 +6348,9 @@ static void ng_emit_runtime(FILE *out) {
     /* 运行时是【完整的】：脚本没用到的内置照样发射，方便 --生成C 产物被人
        二次修改与复用。但这会让 -Wunused-function 报一堆噪音，所以统一标注。 */
     fputs("#if defined(__GNUC__) || defined(__clang__)\n#  define CV_UNUSED __attribute__((unused))\n#else\n#  define CV_UNUSED\n#endif\n", out);
-    fputs("typedef struct { int tag; long i; double f; char *s; int *rc; } CoVal;\n", out);
+    fputs("typedef struct { int tag; long long i; double f; char *s; int *rc; } CoVal;\n", out);
     fputs("#define CV_NULL 0\n#define CV_INT 1\n#define CV_FLT 2\n#define CV_BOOL 3\n#define CV_STR 4\n", out);
-    fputs("static CV_UNUSED CoVal cv_int(long x){ CoVal v; v.tag=CV_INT; v.i=x; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_int(long long x){ CoVal v; v.tag=CV_INT; v.i=x; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
     fputs("static CV_UNUSED CoVal cv_flt(double x){ CoVal v; v.tag=CV_FLT; v.f=x; v.i=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
     fputs("static CV_UNUSED CoVal cv_bool(int x){ CoVal v; v.tag=CV_BOOL; v.i=x?1:0; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
     fputs("static CV_UNUSED CoVal cv_null(void){ CoVal v; v.tag=CV_NULL; v.i=0; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
@@ -6258,7 +6370,7 @@ static void ng_emit_runtime(FILE *out) {
     fputs("static CV_UNUSED double cv_num(CoVal v){ if(v.tag==CV_INT) return (double)v.i; if(v.tag==CV_FLT) return v.f; if(v.tag==CV_BOOL) return (double)v.i; cv_die(\"需要数值，收到非数值类型\"); return 0; }\n", out);
     fputs("static CV_UNUSED char *cv_to_string(CoVal v){ char buf[64];\n", out);
     fputs("    switch(v.tag){ case CV_NULL: return cv_str_dup(\"空\"); case CV_BOOL: return cv_str_dup(v.i?\"真\":\"假\");\n", out);
-    fputs("      case CV_INT: snprintf(buf,sizeof(buf),\"%ld\",v.i); return cv_str_dup(buf);\n", out);
+    fputs("      case CV_INT: snprintf(buf,sizeof(buf),\"%lld\",v.i); return cv_str_dup(buf);\n", out);
     fputs("      case CV_FLT: snprintf(buf,sizeof(buf),\"%g\",v.f); return cv_str_dup(buf);\n", out);
     fputs("      case CV_STR: return cv_str_dup(v.s?v.s:\"\"); default: return cv_str_dup(\"<未知>\"); } }\n", out);
     fputs("static CV_UNUSED int cv_eq(CoVal a, CoVal b){\n", out);
@@ -6280,10 +6392,10 @@ static void ng_emit_runtime(FILE *out) {
     fputs("    if(strcmp(op,\">=\")==0){ int c=cv_cmp(L,R); cv_free(L); cv_free(R); return cv_bool(c>=0); }\n", out);
     fputs("    if(strcmp(op,\"&\")==0||strcmp(op,\"|\")==0||strcmp(op,\"^\")==0||strcmp(op,\"<<\")==0||strcmp(op,\">>\")==0){\n", out);
     fputs("        if(!((L.tag==CV_INT||L.tag==CV_BOOL)&&(R.tag==CV_INT||R.tag==CV_BOOL))) cv_die(\"位运算 %s 需要整数\", op);\n", out);
-    fputs("        long a=L.i,b=R.i,res=0;\n", out);
-    fputs("        if(strcmp(op,\"<<\")==0||strcmp(op,\">>\")==0){ if(b<0) cv_die(\"移位位数不能为负: %ld\",b); if(b>63) cv_die(\"移位位数超出范围: %ld（0~63）\",b);\n", out);
-    fputs("            if(strcmp(op,\"<<\")==0) res=(long)((unsigned long)a<<(unsigned)b);\n", out);
-    fputs("            else res=(a<0)?(long)~((~(unsigned long)a)>>(unsigned)b):(long)((unsigned long)a>>(unsigned)b);\n", out);
+    fputs("        long long a=L.i,b=R.i,res=0;\n", out);
+    fputs("        if(strcmp(op,\"<<\")==0||strcmp(op,\">>\")==0){ if(b<0) cv_die(\"移位位数不能为负: %lld\",b); if(b>63) cv_die(\"移位位数超出范围: %lld（0~63）\",b);\n", out);
+    fputs("            if(strcmp(op,\"<<\")==0) res=(long long)((unsigned long long)a<<(unsigned)b);\n", out);
+    fputs("            else res=(a<0)?(long long)~((~(unsigned long long)a)>>(unsigned)b):(long long)((unsigned long long)a>>(unsigned)b);\n", out);
     fputs("        } else if(strcmp(op,\"&\")==0) res=a&b; else if(strcmp(op,\"|\")==0) res=a|b; else res=a^b;\n", out);
     fputs("        cv_free(L); cv_free(R); return cv_int(res);\n", out);
     fputs("    }\n", out);
@@ -6300,10 +6412,10 @@ static void ng_emit_runtime(FILE *out) {
        写成 %% 会被原样发射进生成代码，导致运行期报「无效的二元运算符: %」。 */
     fputs("    else if(strcmp(op,\"%\")==0){ if(r==0) cv_die(\"取模的除数为零\"); x=fmod(l,r); }\n", out);
     fputs("    else cv_die(\"无效的二元运算符: %s\", op);\n", out);
-    fputs("    cv_free(L); cv_free(R); if(isf) return cv_flt(x); return cv_int((long)x);\n", out);
+    fputs("    cv_free(L); cv_free(R); if(isf) return cv_flt(x); return cv_int((long long)x);\n", out);
     fputs("}\n", out);
-    fputs("static CV_UNUSED long cv_utf8_len(const char *s){ if(!s) return 0; long c=0; while(*s){ if(((*s)&0xC0)!=0x80) c++; s++; } return c; }\n", out);
-    fputs("static CV_UNUSED int cv_utf8_char(const char *s, long ci, char *out){ out[0]=0; if(!s) return 0; long c=0; const char *p=s;\n", out);
+    fputs("static CV_UNUSED long long cv_utf8_len(const char *s){ if(!s) return 0; long long c=0; while(*s){ if(((*s)&0xC0)!=0x80) c++; s++; } return c; }\n", out);
+    fputs("static CV_UNUSED int cv_utf8_char(const char *s, long long ci, char *out){ out[0]=0; if(!s) return 0; long long c=0; const char *p=s;\n", out);
     fputs("    while(*p){ int start=(((*p)&0xC0)!=0x80); if(start){ if(c==ci){ unsigned char b=(unsigned char)*p; int n=1; if((b&0xE0)==0xC0)n=2; else if((b&0xF0)==0xE0)n=3; else if((b&0xF8)==0xF0)n=4; int k=0; while(k<n&&p[k]){ out[k]=(char)p[k]; k++; } out[k]=0; return k; } c++; } p++; } return 0; }\n", out);
     /* 内置函数 */
     fputs("static CV_UNUSED CoVal cv_b_print(CoVal *a, int n){ for(int i=0;i<n;i++){ char *s=cv_to_string(a[i]); printf(\"%s\",s); free(s); if(i<n-1) printf(\" \"); } printf(\"\\n\"); return cv_null(); }\n", out);
@@ -6312,14 +6424,14 @@ static void ng_emit_runtime(FILE *out) {
     fputs("static CV_UNUSED CoVal cv_b_assert(CoVal *a, int n){ if(!cv_truthy(a[0])){ const char *m=(n>=2&&a[1].tag==CV_STR)?a[1].s:\"（无说明）\"; fprintf(stderr,\"断言失败: %s\\n\", m?m:\"\"); exit(1); } return cv_null(); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_assert_eq(CoVal *a, int n){ if(!cv_eq(a[0],a[1])){ char *s0=cv_to_string(a[0]), *s1=cv_to_string(a[1]); const char *m=(n>=3&&a[2].tag==CV_STR)?a[2].s:NULL; fprintf(stderr,\"断言失败: %s == %s（%s）\\n\", s0, s1, m?m:\"\"); free(s0); free(s1); exit(1); } return cv_null(); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_str(CoVal *a, int n){ (void)n; char *s=cv_to_string(a[0]); return cv_str_take(s); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_int(CoVal *a, int n){ (void)n; CoVal v=a[0]; if(v.tag==CV_INT) return cv_int(v.i); if(v.tag==CV_BOOL) return cv_int(v.i?1:0); if(v.tag==CV_FLT) return cv_int((long)v.f); if(v.tag==CV_STR) return cv_int(strtol(v.s,NULL,10)); return cv_int(0); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_int(CoVal *a, int n){ (void)n; CoVal v=a[0]; if(v.tag==CV_INT) return cv_int(v.i); if(v.tag==CV_BOOL) return cv_int(v.i?1:0); if(v.tag==CV_FLT) return cv_int((long long)v.f); if(v.tag==CV_STR) return cv_int((long long)strtoll(v.s,NULL,10)); return cv_int(0); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_flt(CoVal *a, int n){ (void)n; CoVal v=a[0]; if(v.tag==CV_INT||v.tag==CV_BOOL) return cv_flt((double)v.i); if(v.tag==CV_FLT) return cv_flt(v.f); if(v.tag==CV_STR) return cv_flt(strtod(v.s,NULL)); return cv_flt(0); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_bool(CoVal *a, int n){ (void)n; return cv_bool(cv_truthy(a[0])); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_round(CoVal *a, int n){ (void)n; return cv_int((long)llround(cv_num(a[0]))); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_floor(CoVal *a, int n){ (void)n; return cv_int((long)floor(cv_num(a[0]))); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_ceil(CoVal *a, int n){ (void)n; return cv_int((long)ceil(cv_num(a[0]))); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_trunc(CoVal *a, int n){ (void)n; return cv_int((long)trunc(cv_num(a[0]))); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_len(CoVal *a, int n){ (void)n; if(a[0].tag!=CV_STR) return cv_int(1); const char *s=a[0].s; long c=0; while(*s){ if(((*s)&0xC0)!=0x80) c++; s++; } return cv_int(c); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_round(CoVal *a, int n){ (void)n; return cv_int((long long)llround(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_floor(CoVal *a, int n){ (void)n; return cv_int((long long)floor(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_ceil(CoVal *a, int n){ (void)n; return cv_int((long long)ceil(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_trunc(CoVal *a, int n){ (void)n; return cv_int((long long)trunc(cv_num(a[0]))); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_len(CoVal *a, int n){ (void)n; if(a[0].tag!=CV_STR) return cv_int(1); const char *s=a[0].s; long long c=0; while(*s){ if(((*s)&0xC0)!=0x80) c++; s++; } return cv_int(c); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_type(CoVal *a, int n){ (void)n; switch(a[0].tag){ case CV_NULL: return cv_str_dupv(\"空\"); case CV_BOOL: return cv_str_dupv(\"布尔\"); case CV_INT: return cv_str_dupv(\"整数\"); case CV_FLT: return cv_str_dupv(\"浮点\"); case CV_STR: return cv_str_dupv(\"字符串\"); default: return cv_str_dupv(\"未知\"); } }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_abs(CoVal *a, int n){ (void)n; if(a[0].tag==CV_INT) return cv_int(llabs(a[0].i)); return cv_flt(fabs(cv_num(a[0]))); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_sign(CoVal *a, int n){ (void)n; double x=cv_num(a[0]); return cv_int(x>0?1:(x<0?-1:0)); }\n", out);
@@ -6332,14 +6444,14 @@ static void ng_emit_runtime(FILE *out) {
     fputs("static CV_UNUSED CoVal cv_b_pi(CoVal *a, int n){ (void)a; (void)n; return cv_flt(3.14159265358979323846); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_max(CoVal *a, int n){ (void)n; int c; if(a[0].tag==CV_STR&&a[1].tag==CV_STR) c=strcmp(a[0].s?a[0].s:\"\",a[1].s?a[1].s:\"\"); else c=cv_cmp(a[0],a[1]); return cv_retain(c>=0?a[0]:a[1]); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_min(CoVal *a, int n){ (void)n; int c; if(a[0].tag==CV_STR&&a[1].tag==CV_STR) c=strcmp(a[0].s?a[0].s:\"\",a[1].s?a[1].s:\"\"); else c=cv_cmp(a[0],a[1]); return cv_retain(c<=0?a[0]:a[1]); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_hex(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"十六进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; const char *t=\"0123456789abcdef\"; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)t[u%16]; u/=16; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='x'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_bin(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"二进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)('0'+(int)(u&1ULL)); u>>=1; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='b'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_oct(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"八进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)('0'+(int)(u%8ULL)); u/=8; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='o'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_popcount(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int c=0; while(u){ u&=u-1; c++; } return cv_int((long)c); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_getbit(CoVal *a, int n){ (void)n; long b=cv_num(a[1]); if(b<0||b>63) cv_die(\"取位 位号须在 0~63 之间: %ld\",b); unsigned long long u=(unsigned long long)a[0].i; return cv_int((long)((u>>b)&1ULL)); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_setbit(CoVal *a, int n){ (void)n; long b=cv_num(a[1]); if(b<0||b>63) cv_die(\"置位 位号须在 0~63 之间: %ld\",b); long bit=cv_num(a[2]); if(bit!=0&&bit!=1) cv_die(\"置位 目标值只能是 0 或 1: %ld\",bit); unsigned long long u=(unsigned long long)a[0].i; if(bit) u|=(1ULL<<b); else u&=~(1ULL<<b); return cv_int((long)u); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_bytelen(CoVal *a, int n){ (void)n; const char *s=a[0].tag==CV_STR?a[0].s:\"\"; return cv_int((long)strlen(s)); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_byteat(CoVal *a, int n){ (void)n; const char *s=a[0].tag==CV_STR?a[0].s:\"\"; long nn=(long)strlen(s); long i=cv_num(a[1]); if(i<0) i+=nn; if(i<0||i>=nn) cv_die(\"字节 下标越界: %ld（共 %ld 字节）\", i, nn); return cv_int((long)(unsigned char)s[i]); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_hex(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"十六进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; const char *t=\"0123456789abcdef\"; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)t[u%16]; u/=16; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='x'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_bin(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"二进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)('0'+(int)(u&1ULL)); u>>=1; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='b'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_oct(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int w=0; if(n>=2){ long long v=cv_num(a[1]); if(v<0||v>64) cv_die(\"八进制 最小宽度须在 0~64\"); w=(int)v; } char d[65]; int dn=0; if(u==0) d[dn++]='0'; while(u){ d[dn++]=(char)('0'+(int)(u%8ULL)); u/=8; } while(dn<w) d[dn++]='0'; char o[80]; int k=0; o[k++]='0'; o[k++]='o'; for(int i=dn-1;i>=0;i--) o[k++]=d[i]; o[k]=0; return cv_str_dupv(o); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_popcount(CoVal *a, int n){ (void)n; unsigned long long u=(unsigned long long)a[0].i; int c=0; while(u){ u&=u-1; c++; } return cv_int((long long)c); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_getbit(CoVal *a, int n){ (void)n; long long b=cv_num(a[1]); if(b<0||b>63) cv_die(\"取位 位号须在 0~63 之间: %lld\",b); unsigned long long u=(unsigned long long)a[0].i; return cv_int((long long)((u>>b)&1ULL)); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_setbit(CoVal *a, int n){ (void)n; long long b=cv_num(a[1]); if(b<0||b>63) cv_die(\"置位 位号须在 0~63 之间: %lld\",b); long long bit=cv_num(a[2]); if(bit!=0&&bit!=1) cv_die(\"置位 目标值只能是 0 或 1: %lld\",bit); unsigned long long u=(unsigned long long)a[0].i; if(bit) u|=(1ULL<<b); else u&=~(1ULL<<b); return cv_int((long long)u); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_bytelen(CoVal *a, int n){ (void)n; const char *s=a[0].tag==CV_STR?a[0].s:\"\"; return cv_int((long long)strlen(s)); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_byteat(CoVal *a, int n){ (void)n; const char *s=a[0].tag==CV_STR?a[0].s:\"\"; long long nn=(long long)strlen(s); long long i=cv_num(a[1]); if(i<0) i+=nn; if(i<0||i>=nn) cv_die(\"字节 下标越界: %lld（共 %lld 字节）\", i, nn); return cv_int((long long)(unsigned char)s[i]); }\n", out);
     /* 字符串处理：与解释器逐字对齐（大小写只动 ASCII 以免破坏 UTF-8；
        查找/截取一律按【字符】坐标，与 长度/下标 同一坐标系）。 */
     fputs("static CV_UNUSED const char *cv_sarg(CoVal v, const char *who){ if(v.tag!=CV_STR) cv_die(\"%s 需要字符串参数\", who); return v.s?v.s:\"\"; }\n", out);
@@ -6350,21 +6462,21 @@ static void ng_emit_runtime(FILE *out) {
     fputs("static CV_UNUSED CoVal cv_b_strip(CoVal *a, int n){ (void)n; return cv_trim(cv_sarg(a[0],\"去空白\"),1,1); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_lstrip(CoVal *a, int n){ (void)n; return cv_trim(cv_sarg(a[0],\"去左空白\"),1,0); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_rstrip(CoVal *a, int n){ (void)n; return cv_trim(cv_sarg(a[0],\"去右空白\"),0,1); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_repeat(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"重复\"); long k=(long)cv_num(a[1]); if(k<0) cv_die(\"重复次数不能为负数\"); size_t sl=strlen(s); if(k&&sl>((size_t)-1-1)/(size_t)k) cv_die(\"重复结果过长\"); size_t tot=sl*(size_t)k; char *p=(char*)malloc(tot+1); if(!p) cv_die(\"内存不足\"); for(long i=0;i<k;i++) memcpy(p+(size_t)i*sl,s,sl); p[tot]=0; return cv_str_take(p); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_repeat(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"重复\"); long long k=(long long)cv_num(a[1]); if(k<0) cv_die(\"重复次数不能为负数\"); size_t sl=strlen(s); if(k&&sl>((size_t)-1-1)/(size_t)k) cv_die(\"重复结果过长\"); size_t tot=sl*(size_t)k; char *p=(char*)malloc(tot+1); if(!p) cv_die(\"内存不足\"); for(long long i=0;i<k;i++) memcpy(p+(size_t)i*sl,s,sl); p[tot]=0; return cv_str_take(p); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_startswith(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"开头是\"), *p=cv_sarg(a[1],\"开头是\"); return cv_bool(strncmp(s,p,strlen(p))==0); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_endswith(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"结尾是\"), *p=cv_sarg(a[1],\"结尾是\"); size_t ls=strlen(s), lp=strlen(p); return cv_bool(lp<=ls && strcmp(s+ls-lp,p)==0); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_ord(CoVal *a, int n){ const char *s=cv_sarg(a[0],\"字符码\"); long idx=(n>=2)?(long)cv_num(a[1]):0; char cb[8]; if(!cv_utf8_char(s,idx,cb)) cv_die(\"字符码的下标越界\"); unsigned char c0=(unsigned char)cb[0]; int k=1; if((c0&0xE0)==0xC0)k=2; else if((c0&0xF0)==0xE0)k=3; else if((c0&0xF8)==0xF0)k=4; long cp; if(k==1) cp=c0; else if(k==2) cp=((long)(c0&0x1F)<<6)|((unsigned char)cb[1]&0x3F); else if(k==3) cp=((long)(c0&0x0F)<<12)|(((unsigned char)cb[1]&0x3F)<<6)|((unsigned char)cb[2]&0x3F); else cp=((long)(c0&0x07)<<18)|(((long)((unsigned char)cb[1]&0x3F))<<12)|(((long)((unsigned char)cb[2]&0x3F))<<6)|((unsigned char)cb[3]&0x3F); return cv_int(cp); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_chr(CoVal *a, int n){ (void)n; long cp=(long)cv_num(a[0]); if(cp<0||cp>0x10FFFF) cv_die(\"码点超出 Unicode 范围\"); char b[5]; int k; if(cp<0x80){ b[0]=(char)cp; k=1; } else if(cp<0x800){ b[0]=(char)(0xC0|(cp>>6)); b[1]=(char)(0x80|(cp&0x3F)); k=2; } else if(cp<0x10000){ b[0]=(char)(0xE0|(cp>>12)); b[1]=(char)(0x80|((cp>>6)&0x3F)); b[2]=(char)(0x80|(cp&0x3F)); k=3; } else { b[0]=(char)(0xF0|(cp>>18)); b[1]=(char)(0x80|((cp>>12)&0x3F)); b[2]=(char)(0x80|((cp>>6)&0x3F)); b[3]=(char)(0x80|(cp&0x3F)); k=4; } b[k]=0; return cv_str_dupv(b); }\n", out);
-    fputs("static CV_UNUSED long cv_utf8_off(const char *s, long ci){ long c=0; const char *p=s; while(*p){ if(c==ci) return (long)(p-s); unsigned char b=(unsigned char)*p; int k=1; if((b&0xE0)==0xC0)k=2; else if((b&0xF0)==0xE0)k=3; else if((b&0xF8)==0xF0)k=4; p+=k; c++; } return (c==ci)?(long)(p-s):-1; }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_substr(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"截取\"); if(a[1].tag!=CV_INT||a[2].tag!=CV_INT) cv_die(\"截取函数的后两个参数必须是整数\"); long st=a[1].i, cnt=a[2].i, tot=cv_utf8_len(s); if(st<0) st+=tot; if(st<0) st=0; if(st>tot) st=tot; if(cnt<0) cnt=0; if(st+cnt>tot) cnt=tot-st; long b0=cv_utf8_off(s,st), b1=cv_utf8_off(s,st+cnt); if(b0<0) b0=0; if(b1<0) b1=(long)strlen(s); long nb=b1-b0; char *p=(char*)malloc((size_t)nb+1); if(!p) cv_die(\"内存不足\"); memcpy(p,s+b0,(size_t)nb); p[nb]=0; return cv_str_take(p); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_find(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"查找\"), *t=cv_sarg(a[1],\"查找\"); const char *p=strstr(s,t); if(!p) return cv_int(-1); long c=0; for(const char *q=s;*q&&q<p;){ unsigned char b=(unsigned char)*q; int k=1; if((b&0xE0)==0xC0)k=2; else if((b&0xF0)==0xE0)k=3; else if((b&0xF8)==0xF0)k=4; q+=k; c++; } return cv_int(c); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_ord(CoVal *a, int n){ const char *s=cv_sarg(a[0],\"字符码\"); long long idx=(n>=2)?(long long)cv_num(a[1]):0; char cb[8]; if(!cv_utf8_char(s,idx,cb)) cv_die(\"字符码的下标越界\"); unsigned char c0=(unsigned char)cb[0]; int k=1; if((c0&0xE0)==0xC0)k=2; else if((c0&0xF0)==0xE0)k=3; else if((c0&0xF8)==0xF0)k=4; long long cp; if(k==1) cp=c0; else if(k==2) cp=((long long)(c0&0x1F)<<6)|((unsigned char)cb[1]&0x3F); else if(k==3) cp=((long long)(c0&0x0F)<<12)|(((unsigned char)cb[1]&0x3F)<<6)|((unsigned char)cb[2]&0x3F); else cp=((long long)(c0&0x07)<<18)|(((long long)((unsigned char)cb[1]&0x3F))<<12)|(((long long)((unsigned char)cb[2]&0x3F))<<6)|((unsigned char)cb[3]&0x3F); return cv_int(cp); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_chr(CoVal *a, int n){ (void)n; long long cp=(long long)cv_num(a[0]); if(cp<0||cp>0x10FFFF) cv_die(\"码点超出 Unicode 范围\"); char b[5]; int k; if(cp<0x80){ b[0]=(char)cp; k=1; } else if(cp<0x800){ b[0]=(char)(0xC0|(cp>>6)); b[1]=(char)(0x80|(cp&0x3F)); k=2; } else if(cp<0x10000){ b[0]=(char)(0xE0|(cp>>12)); b[1]=(char)(0x80|((cp>>6)&0x3F)); b[2]=(char)(0x80|(cp&0x3F)); k=3; } else { b[0]=(char)(0xF0|(cp>>18)); b[1]=(char)(0x80|((cp>>12)&0x3F)); b[2]=(char)(0x80|((cp>>6)&0x3F)); b[3]=(char)(0x80|(cp&0x3F)); k=4; } b[k]=0; return cv_str_dupv(b); }\n", out);
+    fputs("static CV_UNUSED long long cv_utf8_off(const char *s, long long ci){ long long c=0; const char *p=s; while(*p){ if(c==ci) return (long long)(p-s); unsigned char b=(unsigned char)*p; int k=1; if((b&0xE0)==0xC0)k=2; else if((b&0xF0)==0xE0)k=3; else if((b&0xF8)==0xF0)k=4; p+=k; c++; } return (c==ci)?(long long)(p-s):-1; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_substr(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"截取\"); if(a[1].tag!=CV_INT||a[2].tag!=CV_INT) cv_die(\"截取函数的后两个参数必须是整数\"); long long st=a[1].i, cnt=a[2].i, tot=cv_utf8_len(s); if(st<0) st+=tot; if(st<0) st=0; if(st>tot) st=tot; if(cnt<0) cnt=0; if(st+cnt>tot) cnt=tot-st; long long b0=cv_utf8_off(s,st), b1=cv_utf8_off(s,st+cnt); if(b0<0) b0=0; if(b1<0) b1=(long long)strlen(s); long long nb=b1-b0; char *p=(char*)malloc((size_t)nb+1); if(!p) cv_die(\"内存不足\"); memcpy(p,s+b0,(size_t)nb); p[nb]=0; return cv_str_take(p); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_find(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"查找\"), *t=cv_sarg(a[1],\"查找\"); const char *p=strstr(s,t); if(!p) return cv_int(-1); long long c=0; for(const char *q=s;*q&&q<p;){ unsigned char b=(unsigned char)*q; int k=1; if((b&0xE0)==0xC0)k=2; else if((b&0xF0)==0xE0)k=3; else if((b&0xF8)==0xF0)k=4; q+=k; c++; } return cv_int(c); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_replace(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"替换\"), *o=cv_sarg(a[1],\"替换\"), *r=cv_sarg(a[2],\"替换\"); size_t ol=strlen(o); if(ol==0) cv_die(\"替换函数的被替换串不能为空\"); size_t rl=strlen(r), cap=strlen(s)+16, len=0; char *buf=(char*)malloc(cap); if(!buf) cv_die(\"内存不足\"); const char *p=s; while(*p){ const char *seg; size_t sl; if(strncmp(p,o,ol)==0){ seg=r; sl=rl; p+=ol; } else { seg=p; sl=1; p++; } if(len+sl+1>cap){ while(len+sl+1>cap) cap*=2; buf=(char*)realloc(buf,cap); if(!buf) cv_die(\"内存不足\"); } memcpy(buf+len,seg,sl); len+=sl; } buf[len]=0; return cv_str_take(buf); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_clock(CoVal *a, int n){ (void)a; (void)n; struct timeval tv; gettimeofday(&tv,NULL); return cv_flt((double)tv.tv_sec+(double)tv.tv_usec/1000000.0); }\n", out);
     fputs("\n", out);
 }
 
 static int compile_program_to_c(Node *prog, const char *outpath) {
-    FILE *out = fopen(outpath, "w");
+    FILE *out = fopen(outpath, "wb");
     if (!out) { fprintf(stderr, "无法打开输出文件: %s\n", outpath); return 1; }
     NGen gg; memset(&gg, 0, sizeof gg); gg.out = out;
     /* 第一遍：注册全局变量与函数。
@@ -6411,9 +6523,9 @@ static void derive_out(const char *in, const char *suffix, char *dst, size_t n) 
 
 /* 处理 --生成C / --编译：读取、解析、转译、编译 */
 static int do_compile(const char *mode, const char *infile, const char *outarg) {
-    FILE *f = fopen(infile, "r");
+    FILE *f = fopen(infile, "rb");
     if (!f) { fprintf(stderr, "错误: 无法打开文件 '%s'\n", infile); return 1; }
-    fseek(f, 0, SEEK_END); long size = ftell(f);
+    fseek(f, 0, SEEK_END); long long size = ftell(f);
     if (size < 0) { fclose(f); return 1; }
     fseek(f, 0, SEEK_SET);
     char *buf = malloc(size + 1);
@@ -6433,13 +6545,36 @@ static int do_compile(const char *mode, const char *infile, const char *outarg) 
         return r;
     }
     if (strcmp(mode, "--编译") == 0) {
-        char tmpc[512]; snprintf(tmpc, sizeof tmpc, "/tmp/co_native_%d.c", (int)getpid());
-        if (compile_program_to_c(prog, tmpc) != 0) { node_free(prog); free(buf); return 1; }
+        /* 中间 C 文件放在输出二进制旁边（<输出>.c）：/tmp 在 Windows 原生程序里
+           不存在，且失败时源码留在现场便于排查；编译成功后即删除。 */
         char defbin[512]; const char *bin = outarg;
         if (!bin) { derive_out(infile, "", defbin, sizeof defbin); bin = defbin; }
-        char cmd[2048]; snprintf(cmd, sizeof cmd, "cc -O2 -Wall -Wextra %s -o %s -lm", tmpc, bin);
+        char tmpc[600]; snprintf(tmpc, sizeof tmpc, "%s.c", bin);
+        if (compile_program_to_c(prog, tmpc) != 0) { node_free(prog); free(buf); return 1; }
+#ifdef _WIN32
+        /* 子进程工具链对非 ASCII 输出名会做有损代码页转换（产物名乱码），
+           所以 gcc 先输出到【同目录的纯 ASCII 临时名】，成功后由本进程
+           用宽字符 API 归位到请求路径。同目录内改名不跨卷，必然可行；
+           固定名意味着同目录并发两次 --编译 会互踩——测试脚本均为串行，可接受。 */
+        char tmpbin[600];
+        const char *cut1 = strrchr(bin, '/'), *cut2 = strrchr(bin, '\\');
+        const char *cut = (cut2 > cut1) ? cut2 : cut1;
+        if (cut) snprintf(tmpbin, sizeof tmpbin, "%.*s%s", (int)(cut - bin + 1), bin, "co_native_out.exe");
+        else     snprintf(tmpbin, sizeof tmpbin, "co_native_out.exe");
+        remove(tmpbin);   /* 清理上次失败可能残留的旧产物，避免误用 */
+#else
+        const char *tmpbin = bin;
+#endif
+        char cmd[2048]; snprintf(cmd, sizeof cmd, "cc -O2 -Wall -Wextra %s -o %s -lm", tmpc, tmpbin);
         int r = system(cmd);
         if (r != 0) { fprintf(stderr, "编译失败（C 源码已暂存于 %s）\n", tmpc); node_free(prog); free(buf); return 1; }
+        remove(tmpc);
+#ifdef _WIN32
+        if (!co_move_file_utf8(tmpbin, bin)) {
+            fprintf(stderr, "编译失败：产物无法归位到 %s\n", bin);
+            node_free(prog); free(buf); return 1;
+        }
+#endif
         fprintf(stderr, "已编译原生二进制: %s\n", bin);
         node_free(prog); free(buf);
         return 0;
@@ -6450,6 +6585,10 @@ static int do_compile(const char *mode, const char *infile, const char *outarg) 
 
 /* ========== 主程序 ========== */
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    co_win_args(&argc, &argv);    /* 命令行参数 UTF-16 → UTF-8：中文路径可用 */
+    SetConsoleOutputCP(CP_UTF8);  /* 终端按 UTF-8 显示中文诊断 */
+#endif
     stack_guard_init(0);          /* 必须最先执行：以 main 的栈帧为基准 */
     srand((unsigned int)time(NULL));
     env_lock_init();
@@ -6467,13 +6606,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "示例: ./co hello.co\n");
         return 1;
     }
-    FILE *f = fopen(argv[1], "r");
+    FILE *f = fopen(argv[1], "rb");
     if (!f) {
         fprintf(stderr, "错误: 无法打开文件 '%s'\n", argv[1]);
         return 1;
     }
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    long long size = ftell(f);
     if (size < 0) { perror("ftell"); fclose(f); return 1; }
     fseek(f, 0, SEEK_SET);
     char *buf = malloc(size+1);
