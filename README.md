@@ -37,6 +37,22 @@ make check        # 提交门禁 = test + native + bench + asan + asan-error + t
 
 依赖：仅 `gcc`、`-lm`、`-lpthread`。`--编译` 额外需要环境里有 `cc`。
 
+### Windows（MSYS2）
+
+全量支持，门禁矩阵与 Linux 等价，仅两处平台差异：
+
+```bash
+pacman -S mingw-w64-ucrt-x86_64-toolchain   # UCRT64 环境：make / make test / native / bench
+pacman -S mingw-w64-clang-x86_64-clang      # CLANG64 环境：make asan / asan-error
+```
+
+- 日常构建与功能门禁在 **UCRT64** 环境执行（`make`、`test`、`native`、`bench`）。
+- MSYS2 的 GCC 不附带 sanitizer 运行库（全仓库确认），ASan 门禁改用 **CLANG64**
+  的 clang（compiler-rt 提供），Makefile 已自动切换：在该环境里直接 `make asan` 即可。
+- TSan 运行库在 Windows 上不存在（仅 POSIX），Windows 上 `make tsan` 会明确声明
+  跳过；并发正确性由 POSIX 侧门禁覆盖。
+- 中文路径全程安全：解释器的文件操作与原生后端的产物落盘均走宽字符 API。
+
 ---
 
 ## 2. 数据类型
