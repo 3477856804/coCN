@@ -6597,12 +6597,28 @@ static void co_console_pause(void) {
     fprintf(stderr, "\n运行结束，按回车键退出...");
     while (fgetc(stdin) != '\n' && !feof(stdin)) {}
 }
+
+/* 硬崩溃（访问违例等）不会走 atexit，双击场景窗口会一闪而逝、什么线索都留不下。
+   拦下来：冲刷已有输出、给出异常码，暂停等回车——用户能把信息反馈回来定位。 */
+static LONG WINAPI co_crash_handler(EXCEPTION_POINTERS *ep) {
+    fflush(stdout);
+    if (isatty(_fileno(stdin)) && isatty(_fileno(stdout))) {
+        fprintf(stderr,
+            "\n!! co 解释器内部错误（异常码 0x%08lX）——这是语言实现的问题，不是你的脚本写错。\n"
+            "   请把【脚本内容】和这一整段信息发给开发者。\n"
+            "按回车键退出...",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode);
+        while (fgetc(stdin) != '\n' && !feof(stdin)) {}
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 #endif
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
     co_win_args(&argc, &argv);    /* 命令行参数 UTF-16 → UTF-8：中文路径可用 */
     SetConsoleOutputCP(CP_UTF8);  /* 终端按 UTF-8 显示中文诊断 */
+    SetUnhandledExceptionFilter(co_crash_handler);
 #endif
     stack_guard_init(0);          /* 必须最先执行：以 main 的栈帧为基准 */
     srand((unsigned int)time(NULL));
