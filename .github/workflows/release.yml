@@ -71,8 +71,15 @@ jobs:
           else
             echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
+      - name: 归档构建产物（供下载 / 补传）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
       - name: 上传二进制到 Release
         uses: softprops/action-gh-release@v2
+        continue-on-error: true   # 手动(workflow_dispatch)补传时 token 对既有 release 写入受限，失败不阻塞，产物仍由上方归档
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           files: ${{ matrix.asset }}

@@ -4793,11 +4793,22 @@ static void stack_guard_init(size_t hint) {
 #else
     void  *lo = NULL;
     size_t sz = 0;
+#ifdef __APPLE__
+    /* macOS：没有 pthread_getattr_np，改用 *_np 直接拿栈顶与栈总大小。
+       栈自顶向下生长，最低可用地址 = 栈顶 - 栈大小（与 attr_getstack 同语义）。 */
+    void *top = pthread_get_stackaddr_np(pthread_self());
+    size_t stacksz = pthread_get_stacksize_np(pthread_self());
+    if (top && stacksz > (1u << 20)) {
+        lo = (char *)top - stacksz;
+        sz  = stacksz;
+    }
+#else
     pthread_attr_t at;
     if (pthread_getattr_np(pthread_self(), &at) == 0) {
         if (pthread_attr_getstack(&at, &lo, &sz) != 0) { lo = NULL; sz = 0; }
         pthread_attr_destroy(&at);
     }
+#endif
     if (lo && sz > (1u << 20)) {
         /* lo 是栈的最低可用地址，栈自 lo+sz 向低地址生长。
            预留 1/8（至少 1 MB）：报错路径本身也要栈。 */
