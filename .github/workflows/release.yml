@@ -1,0 +1,78 @@
+name: 发布预编译二进制（Release：Linux/macOS/Windows）
+
+# 打 tag 形如 v0.0.1 时，自动为三大平台构建独立二进制并上传到该 Release。
+# install.sh 会优先从这里下载对应平台的二进制，下不到再回退源码编译。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要附加二进制的已存在 tag（缺省 v0.0.1）
+        required: false
+        default: v0.0.1
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+            asset: coCN-linux-x86_64
+            cc: musl-gcc        # 静态链接，端到端的 Linux 可移植（不依赖目标机 glibc 版本）
+            build: 'musl-gcc -static -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            deps: 'sudo apt-get update && sudo apt-get install -y musl-tools gcc'
+          - os: ubuntu-latest
+            label: linux-aarch64
+            asset: coCN-linux-aarch64
+            cc: gcc             # 交叉工具链；若不可用则回退源码编译
+            build: 'gcc -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            deps: 'true'
+          - os: macos-latest
+            label: darwin-x86_64
+            asset: coCN-darwin-x86_64
+            cc: clang
+            build: 'clang -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            deps: 'true'
+          - os: macos-latest
+            label: darwin-arm64
+            asset: coCN-darwin-arm64
+            cc: clang
+            build: 'clang -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            deps: 'true'
+          - os: msys2-latest    # Windows：MSYS2 静态链接，仅依赖系统 DLL
+            label: windows-x86_64
+            asset: coCN-windows-x86_64.exe
+            cc: gcc
+            build: 'gcc -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread -lshell32 -static && chmod +x "$ASSET"'
+            deps: 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装依赖
+        run: ${{ matrix.deps }}
+      - name: 构建 ${{ matrix.asset }}
+        env:
+          ASSET: ${{ matrix.asset }}
+          CC: ${{ matrix.cc }}
+        run: ${{ matrix.build }}
+      - name: 冒烟测试（--版本）
+        run: ./${{ matrix.asset }} --版本
+      - name: 解析目标 tag
+        id: tag
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 上传二进制到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: ${{ matrix.asset }}

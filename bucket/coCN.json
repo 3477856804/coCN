@@ -1,0 +1,30 @@
+{
+  "version": "0.0.1",
+  "description": "coCN —— 让代码开口说中文的中文编程语言（含张量/自动求导/原生编译/自举）",
+  "homepage": "https://github.com/3477856804/coCN",
+  "license": "Apache-2.0",
+  "notes": "运行方式: coCN 程序.co   （--编译 可生成独立二进制）",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/3477856804/coCN/releases/download/v0.0.1/coCN-windows-x86_64.exe",
+      "hash": "TO_BE_FILLED_AFTER_WINDOWS_BUILD",
+      "bin": [
+        [
+          "coCN-windows-x86_64.exe",
+          "coCN"
+        ]
+      ]
+    }
+  },
+  "post_install": null,
+  "checkver": {
+    "github": "https://github.com/3477856804/coCN"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/3477856804/coCN/releases/download/v$version/coCN-windows-x86_64.exe"
+      }
+    }
+  }
+}

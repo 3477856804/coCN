@@ -9,3 +9,6 @@ core.*
 自举输出
 自举产物.c
 自举输入.co
+coCN-linux-*
+coCN-darwin-*
+coCN-windows-*

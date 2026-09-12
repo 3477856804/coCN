@@ -51,6 +51,27 @@ make check        # 提交门禁 = test + native + bench + selfhost + asan + asa
 
 依赖：仅 `gcc`、`-lm`、`-lpthread`。`--编译` 额外需要环境里有 `cc`。
 
+### 一键安装（推荐）
+
+Linux / macOS / Windows(MSYS2) 通用：脚本会自动下载对应平台的预编译二进制，
+下载不到就回退本地源码编译（只需 `gcc` + `make`）：
+
+```bash
+curl -fsSL https://gitee.com/COSMOnb666/coCN/raw/master/install.sh | bash
+```
+
+装到 `/usr/local/bin/coCN`（用 `COCN_PREFIX` 可改目录），之后直接 `coCN 程序.co` 即可。升级 = 重跑脚本。
+
+macOS 也可以走 Homebrew（源码编译）：
+
+```bash
+brew install https://raw.githubusercontent.com/3477856804/coCN/master/Formula/coCN.rb
+```
+
+> 每打一条 `v*` tag，GitHub Actions 就会自动为 Linux/macOS/Windows 构建预编译二进制，
+> 并挂到 GitHub 与 Gitee 的 Release 中（见 [install.sh](install.sh) 与
+> [release.yml](.github/workflows/release.yml)）。
+
 ### Windows（MSYS2）
 
 全量支持，门禁矩阵与 Linux 等价，仅两处平台差异：
