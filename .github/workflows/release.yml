@@ -37,6 +37,8 @@ jobs:
             asset: coCN-linux-aarch64
             build: 'aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
             deps: 'sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu'
+            # aarch64 二进制无法在 x86 runner 上执行，只做文件类型校验
+            smoke_cmd: 'file coCN-linux-aarch64 && ls -la coCN-linux-aarch64'
           # macOS：按 runner 架构分两个（macos-13=x86_64，macos-14=arm64）
           - os: macos-13
             label: darwin-x86_64
@@ -76,7 +78,7 @@ jobs:
         run: ${{ matrix.build }}
 
       - name: 冒烟测试（--版本）
-        run: ./${{ matrix.asset }} --版本
+        run: ${{ matrix.smoke_cmd || format('./{0} --版本', matrix.asset) }}
 
       - name: 解析目标 tag
         id: tag
