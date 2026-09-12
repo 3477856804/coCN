@@ -31,12 +31,12 @@ jobs:
             asset: coCN-linux-x86_64
             build: 'musl-gcc -static -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
             deps: 'sudo apt-get update && sudo apt-get install -y musl-tools gcc'
-          # Linux arm64：用 arm-runner 原生 gcc 产出真 aarch64
-          - os: ubuntu-24.04-arm
+          # Linux arm64：在 x86_64 上用交叉编译器产出 aarch64（arm-runner 在标准计划不可用，会永久排队）
+          - os: ubuntu-latest
             label: linux-aarch64
             asset: coCN-linux-aarch64
-            build: 'gcc -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
-            deps: 'sudo apt-get update && sudo apt-get install -y gcc'
+            build: 'aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            deps: 'sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu'
           # macOS：按 runner 架构分两个（macos-13=x86_64，macos-14=arm64）
           - os: macos-13
             label: darwin-x86_64
