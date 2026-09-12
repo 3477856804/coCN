@@ -1,0 +1,30 @@
+name: 镜像同步（GitHub ⇄ Gitee）
+
+# 双向自动同步：Gitee 更新 与 GitHub 更新 都会在定时运行时被镜像到另一边。
+# 用 cron 而不是 on.push，是为了避免“同步 push 又触发同步”的无限循环。
+on:
+  schedule:
+    - cron: "*/15 * * * *"      # 每 15 分钟双向同步一次
+  workflow_dispatch:            # 支持在 Actions 页面手动触发
+
+concurrency:
+  group: gitee-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 需要完整历史以判断快进关系
+
+      - name: 双向同步（GitHub ⇄ Gitee）
+        env:
+          GITEE_OWNER: COSMOnb666
+          GITEE_REPO: coCN
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: bash scripts/双向同步.sh
