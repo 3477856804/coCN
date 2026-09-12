@@ -130,7 +130,8 @@ bench: co
 # 自举门禁：coCN 写的编译器由 C 版编译器编译后，再编译示例并逐字节比对解释器。
 # 这是「语言的编译器由语言自身编写」的自举机制验证。
 selfhost: co
-	@sh 测试/自举.sh ./co
+	@sh 测试/自举.sh ./co 自举示例.co
+	@sh 测试/自举.sh ./co 自举函数示例.co
 
 # 数据竞争检查（针对并发用例）
 # Windows 上不存在 TSan 运行库（libtsan 仅 POSIX：Linux/macOS/FreeBSD），
