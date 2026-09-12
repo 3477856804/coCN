@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: coCN.coCN
+PackageVersion: 0.0.1
+PackageLocale: en-US
+Publisher: coCN
+PackageName: coCN (中文编程语言)
+PackageUrl: https://github.com/3477856804/coCN
+License: Apache-2.0
+LicenseUrl: https://github.com/3477856804/coCN/blob/master/LICENSE
+ShortDescription: coCN —— 让代码开口说中文的中文编程语言（含张量/自动求导/原生编译/自举）
+Tags:
+  - 中文编程
+  - language
+  - programming-language
+  - compiler
+  - cocn
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

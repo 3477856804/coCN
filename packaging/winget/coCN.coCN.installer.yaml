@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: coCN.coCN
+PackageVersion: 0.0.1
+InstallerType: portable
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/3477856804/coCN/releases/download/v0.0.1/coCN-windows-x86_64.exe
+    InstallerSha256: TO_BE_FILLED_FROM_WINDOWS_BUILD
+ManifestType: installer
+ManifestVersion: 1.6.0

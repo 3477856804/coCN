@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+# coCN —— 中文编程语言（单文件可移植 exe，随 GitHub Actions 构建产出）
+# 提交位置：https://github.com/microsoft/winget-pkgs/tree/master/manifests/co/coCN
+PackageIdentifier: coCN.coCN
+PackageVersion: 0.0.1
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

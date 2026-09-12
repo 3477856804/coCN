@@ -1,0 +1,23 @@
+# Maintainer: coCN <dev@cocn.local>
+# AUR 包名必须小写，命令名 be coCN。
+pkgname=cocn
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="coCN —— 让代码开口说中文的中文编程语言（张量/自动求导/原生编译/自举，零第三方依赖）"
+arch=('x86_64' 'aarch64')
+url="https://github.com/3477856804/coCN"
+license=('Apache-2.0')
+depends=('glibc' 'gcc-libs')
+makedepends=('gcc' 'make')
+source=("https://github.com/3477856804/coCN/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('95523d0f60e1fc120ec2ede9eb0cb35d0bbb8365ae67967b0c868223c175a947')
+
+build() {
+    cd "${srcdir}/coCN-${pkgver}"
+    make CC=gcc
+}
+
+package() {
+    cd "${srcdir}/coCN-${pkgver}"
+    install -Dm755 ./co "${pkgdir}/usr/bin/coCN"
+}
