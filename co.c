@@ -138,6 +138,12 @@ typedef struct Tensor {
     struct Tensor **children; /* 计算图子节点 */
     int    nchildren;   /* 子节点数量 */
     void  (*backward)(struct Tensor*); /* 反向传播函数 */
+    /* 优化器状态（按需懒分配；不同优化器各自的亚状态仍落在同一对缓冲
+       上，现实中一个要求梯度的参数只配一个优化器，互不混用即可）：
+       om 一阶矩/动量速度，ov 二阶矩，ot 时间步计数（Adam 偏差修正用） */
+    float *om;
+    float *ov;
+    long   ot;
 } Tensor;
 
 /* 前向声明：张量释放（带引用计数） */
@@ -825,6 +831,8 @@ static void tensor_free(Tensor *t) {
     free(t->data);
     free(t->grad);
     free(t->shape);
+    free(t->om);
+    free(t->ov);
     free(t);
 }
 
@@ -4102,6 +4110,27 @@ static Tensor *t_mse(Tensor *a, Tensor *b) {
     c->requires_grad = a->requires_grad || b->requires_grad; c->backward = t_mse_bw; tensor_set_child(c, a); tensor_set_child(c, b);
     return c;
 }
+/* L1 / 平均绝对误差（MAE）：对离群点更稳健的回归损失。
+   梯度是逐元素符号差除 n，比 MSE 对所有样本等权（所以初始收敛更快、
+   对异常值不放大）。 */
+static void t_mae_bw(Tensor *c) {
+    Tensor *a = c->children[0], *b = c->children[1];
+    int n = a->size; float inv = c->grad[0] / n;
+    if (a->requires_grad) { ensure_grad(a);
+        for (int i = 0; i < n; i++) a->grad[i] += (a->data[i] >= b->data[i] ? 1.0f : -1.0f) * inv;
+    }
+    if (b->requires_grad) { ensure_grad(b);
+        for (int i = 0; i < n; i++) b->grad[i] += (a->data[i] >= b->data[i] ? -1.0f : 1.0f) * inv;
+    }
+}
+static Tensor *t_mae(Tensor *a, Tensor *b) {
+    if (a->size != b->size) return NULL;
+    int sh[1] = { 1 }; Tensor *c = tensor_new(1, sh);
+    float s = 0; for (int i = 0; i < a->size; i++) s += fabsf(a->data[i] - b->data[i]);
+    c->data[0] = s / a->size;
+    c->requires_grad = a->requires_grad || b->requires_grad; c->backward = t_mae_bw; tensor_set_child(c, a); tensor_set_child(c, b);
+    return c;
+}
 static int ce_label(Tensor *lab, int r) {
     return (lab->ndim == 1) ? (int)lab->data[r] : (int)lab->data[r * lab->shape[1]];
 }
@@ -4497,6 +4526,149 @@ static Value *builtin_requires_grad(int argc, Value **argv) {
     Value *r = val_new(VAL_TENSOR); r->tval = tensor_retain(argv[0]->tval); return r;
 }
 
+/* ========== 优化器家族（均从 grad 缓冲更新 data，并清零梯度） ==========
+   SGD 见 优化；动量 SGD 与 Adam 需要跨步状态，状态懒分配在 Tensor.om/ov/ot。 */
+
+/* 动量 SGD：速度 v ← 动量·v + 梯度，θ ← θ - 学习率·v。
+   比朴素 SGD 收敛平滑，经典系数 0.9。 */
+static Value *builtin_momentum(int argc, Value **argv) {
+    if (argc != 3) runtime_error(NULL, "动量优化需要3个参数: 学习率, 动量系数, 参数列表");
+    double lr = num_of(argv[0], "动量优化的学习率");
+    double mu = num_of(argv[1], "动量优化的动量系数");
+    if (mu < 0 || mu > 1) runtime_error(NULL, "动量系数必须在 0~1 之间，收到 %g", mu);
+    if (argv[2]->type != VAL_LIST) runtime_error(NULL, "动量优化的第三个参数必须是参数列表");
+    for (int i = 0; i < argv[2]->list_len; i++) {
+        Value *p = argv[2]->lval[i];
+        if (p->type != VAL_TENSOR || !p->tval->requires_grad || !p->tval->grad) continue;
+        Tensor *t = p->tval;
+        if (!t->om) t->om = calloc(t->size, sizeof(float));
+        for (int j = 0; j < t->size; j++) {
+            float v = (float)(mu * t->om[j] + t->grad[j]);
+            t->om[j] = v;
+            t->data[j] -= (float)(lr * v);
+        }
+        memset(t->grad, 0, t->size * sizeof(float));
+    }
+    return val_new(VAL_NULL);
+}
+
+/* Adam：一阶/二阶矩 + 偏差修正，`Adam(学习率, 参数列表[, β1, β2, ε])`。
+   默认 β1=0.9、β2=0.999、ε=1e-8，与 PyTorch 一致。自适应步长让稀疏梯度
+   与噪声梯度都有稳定更新，是深度网络训练的默认选择。 */
+static Value *builtin_adam(int argc, Value **argv) {
+    if (argc < 2) runtime_error(NULL, "Adam需要至少2个参数: 学习率, 参数列表");
+    double lr = num_of(argv[0], "Adam的学习率");
+    if (argv[1]->type != VAL_LIST) runtime_error(NULL, "Adam的第二个参数必须是参数列表");
+    double b1 = 0.9, b2 = 0.999, eps = 1e-8;
+    if (argc >= 3) b1 = num_of(argv[2], "Adam的β1");
+    if (argc >= 4) b2 = num_of(argv[3], "Adam的β2");
+    if (argc >= 5) eps = num_of(argv[4], "Adam的ε");
+    if (b1 < 0 || b1 > 1) runtime_error(NULL, "Adam的β1 必须在 0~1 之间");
+    if (b2 < 0 || b2 > 1) runtime_error(NULL, "Adam的β2 必须在 0~1 之间");
+    if (eps < 0) runtime_error(NULL, "Adam的ε 不能为负");
+    for (int i = 0; i < argv[1]->list_len; i++) {
+        Value *p = argv[1]->lval[i];
+        if (p->type != VAL_TENSOR || !p->tval->requires_grad || !p->tval->grad) continue;
+        Tensor *t = p->tval;
+        if (!t->om) t->om = calloc(t->size, sizeof(float));
+        if (!t->ov) t->ov = calloc(t->size, sizeof(float));
+        t->ot++;
+        double bc1 = 1 - pow(b1, (double)t->ot);   /* 一阶矩偏差修正 */
+        double bc2 = 1 - pow(b2, (double)t->ot);   /* 二阶矩偏差修正 */
+        for (int j = 0; j < t->size; j++) {
+            float g = t->grad[j];
+            float m = (float)(b1 * t->om[j] + (1 - b1) * g);
+            float v = (float)(b2 * t->ov[j] + (1 - b2) * g * g);
+            t->om[j] = m; t->ov[j] = v;
+            float mh = (float)(m / bc1), vh = (float)(v / bc2);
+            t->data[j] -= (float)(lr * mh / (sqrtf(vh) + eps));
+        }
+        memset(t->grad, 0, t->size * sizeof(float));
+    }
+    return val_new(VAL_NULL);
+}
+
+/* 梯度裁剪：把每个参数的梯度限幅到 [-上限, 上限]。梯度爆炸（RNN/深层网络
+   常见）时先裁剪再优化，训练立刻稳定。 */
+static Value *builtin_clip_grad(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "裁剪梯度需要2个参数: 上限, 参数列表");
+    double lim = num_of(argv[0], "裁剪梯度的上限");
+    if (lim < 0) runtime_error(NULL, "裁剪梯度的上限不能为负");
+    if (argv[1]->type != VAL_LIST) runtime_error(NULL, "裁剪梯度的第二个参数必须是参数列表");
+    float hi = (float)lim;
+    for (int i = 0; i < argv[1]->list_len; i++) {
+        Value *p = argv[1]->lval[i];
+        if (p->type != VAL_TENSOR || !p->tval->grad) continue;
+        Tensor *t = p->tval;
+        for (int j = 0; j < t->size; j++) {
+            float g = t->grad[j];
+            if (g >  hi) t->grad[j] =  hi;
+            if (g < -hi) t->grad[j] = -hi;
+        }
+    }
+    return val_new(VAL_NULL);
+}
+
+/* 平均绝对误差（L1），等价于 PyTorch 的 L1Loss，对离群点比 MSE 稳健 */
+static Value *builtin_mae(int argc, Value **argv) {
+    if (argc != 2 || argv[0]->type != VAL_TENSOR || argv[1]->type != VAL_TENSOR) runtime_error(NULL, "平均绝对误差需要两个张量");
+    Tensor *c = t_mae(argv[0]->tval, argv[1]->tval);
+    if (!c) runtime_error(NULL, "平均绝对误差张量大小不一致");
+    Value *r = val_new(VAL_TENSOR); r->tval = c; return r;
+}
+
+/* ========== 模型序列化 ==========
+   二进制格式（顺序可自由读写，只依赖 fread/fwrite，与平台字节序一致即可，
+   保存/加载在同一环境内是自洽的）：
+   i32 参数个数；随后每个参数：i32 维数、i32 形状[维数]、float 数据[元素数]。 */
+static Value *builtin_save_model(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "保存模型需要2个参数: 路径, 参数列表");
+    const char *path = str_arg(argv[0], "保存模型");
+    if (argv[1]->type != VAL_LIST) runtime_error(NULL, "保存模型的第二个参数必须是参数列表");
+    int n = argv[1]->list_len;
+    for (int i = 0; i < n; i++)   /* 先统一校验，避免写一半留下残缺文件 */
+        if (argv[1]->lval[i]->type != VAL_TENSOR)
+            runtime_error(NULL, "保存模型的参数列表里包含非张量（第 %d 项）", i);
+    FILE *f = fopen(path, "wb");
+    if (!f) runtime_error(NULL, "无法写入模型文件: %s", path);
+    int ok = (fwrite(&n, sizeof(int), 1, f) == 1);
+    for (int i = 0; ok && i < n; i++) {
+        Tensor *t = argv[1]->lval[i]->tval;
+        ok = (fwrite(&t->ndim, sizeof(int), 1, f) == 1);
+        ok = ok && fwrite(t->shape, sizeof(int), t->ndim, f) == (size_t)t->ndim;
+        ok = ok && fwrite(t->data, sizeof(float), t->size, f) == (size_t)t->size;
+    }
+    int cerr = fclose(f);
+    if (!ok || cerr != 0) { remove(path); runtime_error(NULL, "写入模型文件未完成: %s", path); }
+    return val_new(VAL_NULL);
+}
+static Value *builtin_load_model(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "加载模型需要2个参数: 路径, 参数列表");
+    const char *path = str_arg(argv[0], "加载模型");
+    if (argv[1]->type != VAL_LIST) runtime_error(NULL, "加载模型的第二个参数必须是参数列表");
+    FILE *f = fopen(path, "rb");
+    if (!f) runtime_error(NULL, "无法打开模型文件: %s", path);
+    int n;
+    if (fread(&n, sizeof(int), 1, f) != 1 || n != argv[1]->list_len) {
+        fclose(f); runtime_error(NULL, "模型文件参数个数与目标不符: 文件 %d 个, 目标 %d 个", n, argv[1]->list_len);
+    }
+    for (int i = 0; i < n; i++) {
+        if (argv[1]->lval[i]->type != VAL_TENSOR) { fclose(f); runtime_error(NULL, "加载模型的目标列表包含非张量（第 %d 项）", i); }
+        Tensor *t = argv[1]->lval[i]->tval;
+        int ndim;
+        if (fread(&ndim, sizeof(int), 1, f) != 1 || ndim != t->ndim || ndim < 1 || ndim > CO_MAX_DIM) {
+            fclose(f); runtime_error(NULL, "模型文件与目标张量维度不符（第 %d 项）", i);
+        }
+        int shape[CO_MAX_DIM];   /* 栈数组：异常 longjmp 不泄漏 */
+        if (fread(shape, sizeof(int), (size_t)ndim, f) != (size_t)ndim) { fclose(f); runtime_error(NULL, "读取模型形状未完成（第 %d 项）", i); }
+        for (int d = 0; d < ndim; d++)
+            if (shape[d] != t->shape[d]) { fclose(f); runtime_error(NULL, "模型文件与目标张量形状不符（第 %d 项）", i); }
+        if (fread(t->data, sizeof(float), (size_t)t->size, f) != (size_t)t->size) { fclose(f); runtime_error(NULL, "读取模型数据未完成（第 %d 项）", i); }
+    }
+    fclose(f);
+    return val_new(VAL_NULL);
+}
+
 /* 断言：条件为假立即报错退出，是自动化测试的基石 */
 static Value *builtin_assert(int argc, Value **argv) {
     if (argc < 1) runtime_error(NULL, "断言函数需要至少1个参数");
@@ -4649,6 +4821,14 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "取") == 0) return builtin_get(argc, argv);
     if (strcmp(name, "置") == 0) return builtin_set(argc, argv);
     if (strcmp(name, "需梯度") == 0) return builtin_requires_grad(argc, argv);
+    /* 优化器家族 */
+    if (strcmp(name, "动量优化") == 0) return builtin_momentum(argc, argv);
+    if (strcmp(name, "Adam") == 0) return builtin_adam(argc, argv);
+    if (strcmp(name, "裁剪梯度") == 0) return builtin_clip_grad(argc, argv);
+    if (strcmp(name, "平均绝对误差") == 0) return builtin_mae(argc, argv);
+    /* 模型序列化 */
+    if (strcmp(name, "保存模型") == 0) return builtin_save_model(argc, argv);
+    if (strcmp(name, "加载模型") == 0) return builtin_load_model(argc, argv);
 
     runtime_error(NULL, "未知内置函数: %s", name);
     return NULL;
