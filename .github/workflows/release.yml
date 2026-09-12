@@ -27,29 +27,34 @@ jobs:
             label: linux-x86_64
             asset: coCN-linux-x86_64
             build: 'musl-gcc -static -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            shell: bash
             deps: 'sudo apt-get update && sudo apt-get install -y musl-tools gcc'
           # Linux arm64：用 arm-runner 原生 gcc 产出真 aarch64
           - os: ubuntu-24.04-arm
             label: linux-aarch64
             asset: coCN-linux-aarch64
             build: 'gcc -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            shell: bash
             deps: 'sudo apt-get update && sudo apt-get install -y gcc'
           # macOS：按 runner 架构分两个（macos-13=x86_64，macos-14=arm64）
           - os: macos-13
             label: darwin-x86_64
             asset: coCN-darwin-x86_64
             build: 'clang -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            shell: bash
             deps: 'true'
           - os: macos-14
             label: darwin-arm64
             asset: coCN-darwin-arm64
             build: 'clang -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread && chmod +x "$ASSET"'
+            shell: bash
             deps: 'true'
-          # Windows：MSYS2 静态链接，仅依赖系统 DLL
+          # Windows：MSYS2 静态链接，仅依赖系统 DLL（必须用 msys2 shell，否则 "$ASSET" 在 PowerShell 下为空）
           - os: windows-latest
             label: windows-x86_64
             asset: coCN-windows-x86_64.exe
             build: 'gcc -O2 -Wall -Wextra -o "$ASSET" co.c -lm -lpthread -lshell32 -static && chmod +x "$ASSET"'
+            shell: msys2 {0}
             deps: 'true'
 
     steps:
@@ -70,13 +75,16 @@ jobs:
       - name: 构建 ${{ matrix.asset }}
         env:
           ASSET: ${{ matrix.asset }}
+        shell: ${{ matrix.shell }}
         run: ${{ matrix.build }}
 
       - name: 冒烟测试（--版本）
+        shell: ${{ matrix.shell }}
         run: ./${{ matrix.asset }} --版本
 
       - name: 解析目标 tag
         id: tag
+        shell: ${{ matrix.shell }}
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
             echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"

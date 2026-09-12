@@ -4975,7 +4975,11 @@ static void stack_guard_init(size_t hint) {
     size_t sz = 0;
 #ifdef __APPLE__
     /* macOS：没有 pthread_getattr_np，改用 *_np 直接拿栈顶与栈总大小。
-       栈自顶向下生长，最低可用地址 = 栈顶 - 栈大小（与 attr_getstack 同语义）。 */
+       栈自顶向下生长，最低可用地址 = 栈顶 - 栈大小（与 attr_getstack 同语义）。
+       注：文件顶部 _POSIX_C_SOURCE 200809L 会把 macOS 的 *_np 扩展隐藏起来，
+       这里显式 extern 声明以保证在 Xcode/clang 下也能编译。 */
+    extern void *pthread_get_stackaddr_np(pthread_t);
+    extern size_t pthread_get_stacksize_np(pthread_t);
     void *top = pthread_get_stackaddr_np(pthread_self());
     size_t stacksz = pthread_get_stacksize_np(pthread_self());
     if (top && stacksz > (1u << 20)) {
