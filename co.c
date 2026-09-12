@@ -5958,6 +5958,10 @@ static const char *ng_builtin_cname(const char *name) {
         {"字符码","cv_b_ord"},{"码转字符","cv_b_chr"},
         {"截取","cv_b_substr"},{"查找","cv_b_find"},{"替换","cv_b_replace"},
         {"时钟","cv_b_clock"},
+        /* 列表与文件/命令：自举编译器（在 coCN 里写、由 co --编译 编译）依赖它们 */
+        {"追加","cv_b_append"},
+        {"读文件","cv_b_readfile"},{"写文件","cv_b_writefile"},{"追加文件","cv_b_appendfile"},
+        {"文件存在","cv_b_fileexists"},{"执行命令","cv_b_system"},
         {NULL,NULL}
     };
     for (int i = 0; tbl[i].cn; i++) if (strcmp(tbl[i].cn, name) == 0) return tbl[i].cf;
@@ -6056,13 +6060,16 @@ static char *ng_expr(NGen *g, Node *n) {
                后续 `_aN[i] = tmp;` 会引用到不存在的名字。 */
             fprintf(g->out, "    CoVal %s;\n", tmp);
             fprintf(g->out,
-                "    { CoVal _L = %s, _R = %s; long long _idx = cv_num(_R);"
-                " const char *_cs = (_L.tag == CV_STR ? _L.s : \"\");"
+                "    { CoVal _L = %s, _R = %s; long long _idx = cv_num(_R);\n"
+                "      if (_L.tag == CV_LIST) { %s = cv_list_at(_L, _idx); }\n"
+                "      else if (_L.tag == CV_STR) { const char *_cs = _L.s ? _L.s : \"\";"
                 " long long _sl = cv_utf8_len(_cs); long long _ci = (_idx < 0) ? _idx + _sl : _idx;"
                 " if (_ci < 0 || _ci >= _sl) cv_die(\"字符串索引越界\");"
                 " char _cb[8]; cv_utf8_char(_cs, _ci, _cb);"
-                " %s = cv_str_take(cv_str_dup(_cb)); cv_free(_L); cv_free(_R); }\n",
-                l, r, tmp);
+                " %s = cv_str_take(cv_str_dup(_cb)); }\n"
+                "      else cv_die(\"无法索引该类型\");\n"
+                "      cv_free(_L); cv_free(_R); }\n",
+                l, r, tmp, tmp);
             free(l); free(r);
             break;
         }
@@ -6099,6 +6106,16 @@ static char *ng_expr(NGen *g, Node *n) {
     case ND_FUNC_CALL:
         ng_expr_call(g, n, tmp);
         break;
+    case ND_LIST_LIT: {
+        if (n->list_lit.is_comprehension) ng_error(g, n, "原生编译暂不支持列表推导式");
+        fprintf(g->out, "    CoVal %s = cv_list_new();\n", tmp);
+        for (int i = 0; i < n->list_lit.ecnt; i++) {
+            char *e = ng_expr(g, n->list_lit.elements[i]);
+            fprintf(g->out, "    { CoVal _le = %s; cv_list_push(&%s, _le); cv_free(_le); }\n", e, tmp);
+            free(e);
+        }
+        break;
+    }
     default:
         ng_error(g, n, "原生编译暂不支持的表达式节点(类型 %d)", n->type);
     }
@@ -6299,6 +6316,10 @@ static void ng_collect(NGen *g, Node *n) {
     case ND_FUNC_CALL:
         for (int i = 0; i < n->func_call.acnt; i++) ng_collect(g, n->func_call.args[i]);
         break;
+    case ND_LIST_LIT:
+        for (int i = 0; i < n->list_lit.ecnt; i++)
+            if (n->list_lit.elements[i]) ng_collect(g, n->list_lit.elements[i]);
+        break;
     default: break;
     }
 }
@@ -6348,8 +6369,12 @@ static void ng_emit_runtime(FILE *out) {
     /* 运行时是【完整的】：脚本没用到的内置照样发射，方便 --生成C 产物被人
        二次修改与复用。但这会让 -Wunused-function 报一堆噪音，所以统一标注。 */
     fputs("#if defined(__GNUC__) || defined(__clang__)\n#  define CV_UNUSED __attribute__((unused))\n#else\n#  define CV_UNUSED\n#endif\n", out);
-    fputs("typedef struct { int tag; long long i; double f; char *s; int *rc; } CoVal;\n", out);
-    fputs("#define CV_NULL 0\n#define CV_INT 1\n#define CV_FLT 2\n#define CV_BOOL 3\n#define CV_STR 4\n", out);
+    /* 列表用堆上的 LList（items/len/cap），CoVal 只持指针：追加是「原地改堆」，
+       所有共享同一 LList 的 CoVal 副本都能看到新长度，与解释器里列表可变语义一致。 */
+    fputs("typedef struct LList LList;\n", out);
+    fputs("typedef struct { int tag; long long i; double f; char *s; int *rc; LList *l; } CoVal;\n", out);
+    fputs("struct LList { CoVal *items; long long len; long long cap; };\n", out);
+    fputs("#define CV_NULL 0\n#define CV_INT 1\n#define CV_FLT 2\n#define CV_BOOL 3\n#define CV_STR 4\n#define CV_LIST 5\n", out);
     fputs("static CV_UNUSED CoVal cv_int(long long x){ CoVal v; v.tag=CV_INT; v.i=x; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
     fputs("static CV_UNUSED CoVal cv_flt(double x){ CoVal v; v.tag=CV_FLT; v.f=x; v.i=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
     fputs("static CV_UNUSED CoVal cv_bool(int x){ CoVal v; v.tag=CV_BOOL; v.i=x?1:0; v.f=0; v.s=NULL; v.rc=NULL; return v; }\n", out);
@@ -6361,18 +6386,24 @@ static void ng_emit_runtime(FILE *out) {
     fputs("static CV_UNUSED char *cv_str_dup(const char *s){ size_t n=s?strlen(s):0; char *p=(char*)malloc(n+1); if(!p) cv_die(\"内存不足\"); if(s) memcpy(p,s,n); p[n]=0; return p; }\n", out);
     fputs("static CV_UNUSED CoVal cv_str_take(char *s){ CoVal v; v.tag=CV_STR; v.i=0; v.f=0; v.s=s; v.rc=(int*)malloc(sizeof(int)); if(!v.rc) cv_die(\"内存不足\"); *(v.rc)=1; return v; }\n", out);
     fputs("static CV_UNUSED CoVal cv_str_dupv(const char *s){ return cv_str_take(cv_str_dup(s)); }\n", out);
-    fputs("static CV_UNUSED void cv_free(CoVal v){ if(v.tag==CV_STR && v.s){ if(v.rc){ if(--(*v.rc)<=0){ free(v.s); free(v.rc); } } } }\n", out);
-    fputs("static CV_UNUSED CoVal cv_retain(CoVal v){ if(v.tag==CV_STR && v.rc) (*v.rc)++; return v; }\n", out);
+    fputs("static CV_UNUSED void cv_free(CoVal v){ if(v.tag==CV_STR && v.s){ if(v.rc){ if(--(*v.rc)<=0){ free(v.s); free(v.rc); } } } else if(v.tag==CV_LIST && v.l){ if(v.rc){ if(--(*v.rc)<=0){ for(long long ci=0; ci<v.l->len; ci++) cv_free(v.l->items[ci]); free(v.l->items); free(v.l); free(v.rc); } } } }\n", out);
+    fputs("static CV_UNUSED CoVal cv_retain(CoVal v){ if(v.rc && (v.tag==CV_STR || v.tag==CV_LIST)) (*v.rc)++; return v; }\n", out);
+    /* 列表运行时：新建 / 原地追加 / 取元素（支持负下标）。追加原地改堆，返回原列表（可链式）。 */
+    fputs("static CV_UNUSED CoVal cv_list_new(void){ CoVal v; v.tag=CV_LIST; v.i=0; v.f=0; v.s=NULL; v.rc=(int*)malloc(sizeof(int)); if(!v.rc) cv_die(\"内存不足\"); *v.rc=1; v.l=(LList*)calloc(1,sizeof(LList)); if(!v.l) cv_die(\"内存不足\"); return v; }\n", out);
+    fputs("static CV_UNUSED void cv_list_push(CoVal *v, CoVal e){ LList *L=v->l; if(!L) cv_die(\"追加的目标不是列表\"); if(L->len>=L->cap){ long long nc=L->cap?L->cap*2:4; CoVal *ni=(CoVal*)realloc(L->items,(size_t)nc*sizeof(CoVal)); if(!ni) cv_die(\"内存不足\"); L->items=ni; L->cap=nc; } L->items[L->len]=cv_retain(e); L->len++; }\n", out);
+    fputs("static CV_UNUSED CoVal cv_list_at(CoVal v, long long idx){ if(!v.l) cv_die(\"索引的目标不是列表\"); long long n=v.l->len; long long i=idx; if(i<0) i+=n; if(i<0||i>=n) cv_die(\"列表索引越界: %lld（长度 %lld）\", idx, n); return cv_retain(v.l->items[i]); }\n", out);
     fputs("static CV_UNUSED int cv_truthy(CoVal v){\n", out);
-    fputs("    switch(v.tag){ case CV_NULL: return 0; case CV_INT: return v.i!=0; case CV_FLT: return (v.f!=0.0)&&!isnan(v.f); case CV_BOOL: return v.i!=0; case CV_STR: return v.s&&v.s[0]!='\\0'; default: return 0; }\n", out);
+    fputs("    switch(v.tag){ case CV_NULL: return 0; case CV_INT: return v.i!=0; case CV_FLT: return (v.f!=0.0)&&!isnan(v.f); case CV_BOOL: return v.i!=0; case CV_STR: return v.s&&v.s[0]!='\\0'; case CV_LIST: return v.l?v.l->len>0:0; default: return 0; }\n", out);
     fputs("}\n", out);
     fputs("static CV_UNUSED int cv_isnum(CoVal v){ return v.tag==CV_INT||v.tag==CV_FLT||v.tag==CV_BOOL; }\n", out);
     fputs("static CV_UNUSED double cv_num(CoVal v){ if(v.tag==CV_INT) return (double)v.i; if(v.tag==CV_FLT) return v.f; if(v.tag==CV_BOOL) return (double)v.i; cv_die(\"需要数值，收到非数值类型\"); return 0; }\n", out);
+    fputs("static CV_UNUSED char *cv_list_str(CoVal v);\n", out);
     fputs("static CV_UNUSED char *cv_to_string(CoVal v){ char buf[64];\n", out);
     fputs("    switch(v.tag){ case CV_NULL: return cv_str_dup(\"空\"); case CV_BOOL: return cv_str_dup(v.i?\"真\":\"假\");\n", out);
     fputs("      case CV_INT: snprintf(buf,sizeof(buf),\"%lld\",v.i); return cv_str_dup(buf);\n", out);
     fputs("      case CV_FLT: snprintf(buf,sizeof(buf),\"%g\",v.f); return cv_str_dup(buf);\n", out);
-    fputs("      case CV_STR: return cv_str_dup(v.s?v.s:\"\"); default: return cv_str_dup(\"<未知>\"); } }\n", out);
+    fputs("      case CV_STR: return cv_str_dup(v.s?v.s:\"\"); case CV_LIST: return cv_list_str(v); default: return cv_str_dup(\"<未知>\"); } }\n", out);
+    fputs("static CV_UNUSED char *cv_list_str(CoVal v){ size_t cap=32, len=0; char *b=(char*)malloc(cap); if(!b) cv_die(\"内存不足\"); b[len++]='['; if(v.l) for(long long k=0;k<v.l->len;k++){ if(k>0){ while(len+2>cap){ cap*=2; b=(char*)realloc(b,cap); if(!b) cv_die(\"内存不足\"); } b[len++]=','; b[len++]=' '; } char *e=cv_to_string(v.l->items[k]); size_t el=strlen(e); while(len+el+2>cap){ cap*=2; b=(char*)realloc(b,cap); if(!b) cv_die(\"内存不足\"); } memcpy(b+len,e,el); len+=el; free(e); } while(len+2>cap){ cap*=2; b=(char*)realloc(b,cap); if(!b) cv_die(\"内存不足\"); } b[len++]=']'; b[len]=0; return b; }\n", out);
     fputs("static CV_UNUSED int cv_eq(CoVal a, CoVal b){\n", out);
     fputs("    if(a.tag==b.tag){ if(a.tag==CV_INT||a.tag==CV_BOOL) return a.i==b.i; if(a.tag==CV_FLT) return a.f==b.f; if(a.tag==CV_STR) return (a.s&&b.s)?(strcmp(a.s,b.s)==0):(a.s==b.s); if(a.tag==CV_NULL) return 1; }\n", out);
     fputs("    if(cv_isnum(a)&&cv_isnum(b)) return cv_num(a)==cv_num(b);\n", out);
@@ -6431,8 +6462,8 @@ static void ng_emit_runtime(FILE *out) {
     fputs("static CV_UNUSED CoVal cv_b_floor(CoVal *a, int n){ (void)n; return cv_int((long long)floor(cv_num(a[0]))); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_ceil(CoVal *a, int n){ (void)n; return cv_int((long long)ceil(cv_num(a[0]))); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_trunc(CoVal *a, int n){ (void)n; return cv_int((long long)trunc(cv_num(a[0]))); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_len(CoVal *a, int n){ (void)n; if(a[0].tag!=CV_STR) return cv_int(1); const char *s=a[0].s; long long c=0; while(*s){ if(((*s)&0xC0)!=0x80) c++; s++; } return cv_int(c); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_type(CoVal *a, int n){ (void)n; switch(a[0].tag){ case CV_NULL: return cv_str_dupv(\"空\"); case CV_BOOL: return cv_str_dupv(\"布尔\"); case CV_INT: return cv_str_dupv(\"整数\"); case CV_FLT: return cv_str_dupv(\"浮点\"); case CV_STR: return cv_str_dupv(\"字符串\"); default: return cv_str_dupv(\"未知\"); } }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_len(CoVal *a, int n){ (void)n; if(a[0].tag==CV_STR){ const char *s=a[0].s; long long c=0; while((s&&*s)){ if(((*s)&0xC0)!=0x80) c++; s++; } return cv_int(c); } if(a[0].tag==CV_LIST) return cv_int(a[0].l?a[0].l->len:0); return cv_int(1); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_type(CoVal *a, int n){ (void)n; switch(a[0].tag){ case CV_NULL: return cv_str_dupv(\"空\"); case CV_BOOL: return cv_str_dupv(\"布尔\"); case CV_INT: return cv_str_dupv(\"整数\"); case CV_FLT: return cv_str_dupv(\"浮点\"); case CV_STR: return cv_str_dupv(\"字符串\"); case CV_LIST: return cv_str_dupv(\"列表\"); default: return cv_str_dupv(\"未知\"); } }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_abs(CoVal *a, int n){ (void)n; if(a[0].tag==CV_INT) return cv_int(llabs(a[0].i)); return cv_flt(fabs(cv_num(a[0]))); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_sign(CoVal *a, int n){ (void)n; double x=cv_num(a[0]); return cv_int(x>0?1:(x<0?-1:0)); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_pow(CoVal *a, int n){ (void)n; return cv_flt(pow(cv_num(a[0]),cv_num(a[1]))); }\n", out);
@@ -6472,6 +6503,14 @@ static void ng_emit_runtime(FILE *out) {
     fputs("static CV_UNUSED CoVal cv_b_find(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"查找\"), *t=cv_sarg(a[1],\"查找\"); const char *p=strstr(s,t); if(!p) return cv_int(-1); long long c=0; for(const char *q=s;*q&&q<p;){ unsigned char b=(unsigned char)*q; int k=1; if((b&0xE0)==0xC0)k=2; else if((b&0xF0)==0xE0)k=3; else if((b&0xF8)==0xF0)k=4; q+=k; c++; } return cv_int(c); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_replace(CoVal *a, int n){ (void)n; const char *s=cv_sarg(a[0],\"替换\"), *o=cv_sarg(a[1],\"替换\"), *r=cv_sarg(a[2],\"替换\"); size_t ol=strlen(o); if(ol==0) cv_die(\"替换函数的被替换串不能为空\"); size_t rl=strlen(r), cap=strlen(s)+16, len=0; char *buf=(char*)malloc(cap); if(!buf) cv_die(\"内存不足\"); const char *p=s; while(*p){ const char *seg; size_t sl; if(strncmp(p,o,ol)==0){ seg=r; sl=rl; p+=ol; } else { seg=p; sl=1; p++; } if(len+sl+1>cap){ while(len+sl+1>cap) cap*=2; buf=(char*)realloc(buf,cap); if(!buf) cv_die(\"内存不足\"); } memcpy(buf+len,seg,sl); len+=sl; } buf[len]=0; return cv_str_take(buf); }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_clock(CoVal *a, int n){ (void)a; (void)n; struct timeval tv; gettimeofday(&tv,NULL); return cv_flt((double)tv.tv_sec+(double)tv.tv_usec/1000000.0); }\n", out);
+    /* 列表：追加（原地改堆，返回原列表可链式） */
+    fputs("static CV_UNUSED CoVal cv_b_append(CoVal *a, int n){ if(n!=2) cv_die(\"追加需要2个参数（列表, 元素）\"); cv_list_push(&a[0], a[1]); return cv_retain(a[0]); }\n", out);
+    /* 文件 IO 与命令执行：自举编译器读取源码、落盘 C、调用 cc 都靠它们 */
+    fputs("static CV_UNUSED CoVal cv_b_readfile(CoVal *a, int n){ if(n!=1) cv_die(\"读文件需要1个参数\"); const char *path=cv_sarg(a[0],\"读文件\"); FILE *f=fopen(path,\"rb\"); if(!f) cv_die(\"无法打开文件: %s\", path); if(fseek(f,0,SEEK_END)){ fclose(f); cv_die(\"无法定位文件末尾\"); } long long sz=ftell(f); rewind(f); char *buf=(char*)malloc((size_t)sz+1); if(!buf){ fclose(f); cv_die(\"内存不足\"); } size_t got=fread(buf,1,(size_t)sz,f); fclose(f); buf[got]=0; return cv_str_take(buf); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_writefile(CoVal *a, int n){ if(n!=2) cv_die(\"写文件需要2个参数（路径, 内容）\"); const char *path=cv_sarg(a[0],\"写文件\"); char *c=cv_to_string(a[1]); size_t cl=strlen(c); FILE *f=fopen(path,\"wb\"); if(!f){ free(c); cv_die(\"无法写入文件: %s\", path); } size_t w=fwrite(c,1,cl,f); int e=fclose(f); free(c); if(w!=cl||e) cv_die(\"写入文件未完成: %s\", path); return cv_int((long long)w); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_appendfile(CoVal *a, int n){ if(n!=2) cv_die(\"追加文件需要2个参数（路径, 内容）\"); const char *path=cv_sarg(a[0],\"追加文件\"); char *c=cv_to_string(a[1]); size_t cl=strlen(c); FILE *f=fopen(path,\"ab\"); if(!f){ free(c); cv_die(\"无法写入文件: %s\", path); } size_t w=fwrite(c,1,cl,f); int e=fclose(f); free(c); if(w!=cl||e) cv_die(\"写入文件未完成: %s\", path); return cv_int((long long)w); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_fileexists(CoVal *a, int n){ (void)n; const char *p=cv_sarg(a[0],\"文件存在\"); FILE *f=fopen(p,\"rb\"); int ok=f?1:0; if(f) fclose(f); return cv_bool(ok); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_system(CoVal *a, int n){ (void)n; const char *cmd=cv_sarg(a[0],\"执行命令\"); int r=system(cmd); return cv_int(r); }\n", out);
     fputs("\n", out);
 }
 
@@ -6494,7 +6533,7 @@ static int compile_program_to_c(Node *prog, const char *outpath) {
     /* 全局变量必须用【常量】初始化：静态存储期对象不允许调函数。
        这里直接展开 cv_null() 的字面值，与 CoVal 字段顺序一一对应。 */
     for (int i = 0; i < gg.g_n; i++)
-        fprintf(out, "static CoVal %s = { CV_NULL, 0, 0.0, NULL, NULL };  /* 原名: %s */\n",
+        fprintf(out, "static CoVal %s = { CV_NULL, 0, 0.0, NULL, NULL, NULL };  /* 原名: %s */\n",
                 gg.g_cnames[i], gg.g_names[i]);
     fprintf(out, "\n");
     for (int i = 0; i < gg.f_n; i++) fprintf(out, "static CoVal %s(CoVal *, int);\n", gg.f_cnames[i]);
