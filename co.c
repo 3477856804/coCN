@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE            /* pthread_getattr_np：取本线程真实栈区间 */
+#define CO_VERSION "0.0.1"     /* 版本号：0.0.1 为「自举」里程碑 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3753,6 +3754,11 @@ static Value *builtin_delete_file(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "删除文件函数需要1个参数");
     return val_bool(remove(str_arg(argv[0], "删除文件")) == 0);
 }
+/* 执行命令(命令串) -> 退出状态；自举编译器用它调用 cc 组装独立二进制 */
+static Value *builtin_exec(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "执行命令函数需要1个参数");
+    return val_int((long long)system(str_arg(argv[0], "执行命令")));
+}
 /* 读取行(路径) -> 行列表（去掉行尾换行） */
 static Value *builtin_read_lines(int argc, Value **argv) {
     Value *whole = builtin_read_file(argc, argv);
@@ -4615,6 +4621,7 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "追加文件") == 0) return builtin_append_file(argc, argv);
     if (strcmp(name, "文件存在") == 0) return builtin_file_exists(argc, argv);
     if (strcmp(name, "删除文件") == 0) return builtin_delete_file(argc, argv);
+    if (strcmp(name, "执行命令") == 0) return builtin_exec(argc, argv);
     if (strcmp(name, "读取行") == 0) return builtin_read_lines(argc, argv);
     /* 张量 / 模型开发 */
     if (strcmp(name, "张量") == 0) return builtin_tensor(argc, argv);
@@ -6697,6 +6704,12 @@ int main(int argc, char **argv) {
         atexit(co_console_pause);     /* 无论运行成败，退出前都停一下，让用户看到结果 */
     }
 #endif
+
+    if (argc >= 2 && (strcmp(argv[1], "--版本") == 0 || strcmp(argv[1], "--version") == 0 ||
+                      strcmp(argv[1], "-v") == 0)) {
+        printf("coCN 中文编程语言 %s（自举里程碑）\n", CO_VERSION);
+        return 0;
+    }
 
     if (argc >= 2 && (strcmp(argv[1], "--生成C") == 0 || strcmp(argv[1], "--编译") == 0)) {
         if (argc < 3) {

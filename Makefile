@@ -127,6 +127,11 @@ native: co
 bench: co
 	@sh 测试/基准运行.sh ./co 测试/基准/性能基准.co
 
+# 自举门禁：coCN 写的编译器由 C 版编译器编译后，再编译示例并逐字节比对解释器。
+# 这是「语言的编译器由语言自身编写」的自举机制验证。
+selfhost: co
+	@sh 测试/自举.sh ./co
+
 # 数据竞争检查（针对并发用例）
 # Windows 上不存在 TSan 运行库（libtsan 仅 POSIX：Linux/macOS/FreeBSD），
 # 这是平台事实而非可修复缺陷——明确声明跳过，不假装检查；POSIX 照常执行。
@@ -148,10 +153,10 @@ tsan: co.c
 endif
 
 # 提交前的完整门禁
-check: test native bench asan asan-error tsan
+check: test native bench selfhost asan asan-error tsan
 	@echo "===================================="
-	@echo " 全部门禁通过：功能 + 错误路径 + 原生双通道一致 + 基准结果一致 + ASan/UBSan + 错误路径内存安全 + TSan"
+	@echo " 全部门禁通过：功能 + 错误路径 + 原生双通道一致 + 基准结果一致 + 自举流水线 + ASan/UBSan + 错误路径内存安全 + TSan"
 	@echo "===================================="
 
 clean:
-	rm -f co co_asan co_tsan core.*
+	rm -f co co_asan co_tsan 自举cc 自举输出 自举产物.c 自举输入.co core.*
