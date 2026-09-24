@@ -465,6 +465,39 @@ static void co_tmp_free(void *p) {
     free(p);
 }
 
+/* ---------- 路径归一化 ----------
+   /tmp 是 POSIX 的约定临时目录，Windows 上没有这个目录，直接打开会失败。
+   在 Windows 上把 /tmp 与 /tmp/xxx 映射到系统临时目录（GetTempPath），
+   让「写临时文件」的源码在两条通道、两个平台下语义一致。
+   返回 co_tmp_alloc 的缓冲（异常安全）；无需改写时原样返回入参。 */
+static const char *co_resolve_path(const char *path) {
+#ifdef _WIN32
+    if (path && strncmp(path, "/tmp", 4) == 0 &&
+        (path[4] == '\0' || path[4] == '/' || path[4] == '\\')) {
+        wchar_t wbuf[32768];
+        DWORD n = GetTempPathW(32768, wbuf);
+        if (n > 0 && n < 32768) {
+            int len = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, NULL, 0, NULL, NULL);
+            if (len > 1) {
+                const char *rest = path + 4;            /* "" 或 "/xxx" */
+                char *tmp8 = (char *)co_tmp_alloc((size_t)len + strlen(rest) + 2);
+                if (!tmp8) return path;
+                WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, tmp8, len, NULL, NULL);
+                size_t tl = strlen(tmp8);
+                /* GetTempPathW 通常以 '\' 结尾，去掉再拼 '/'，避免双斜杠 */
+                while (tl > 0 && (tmp8[tl-1] == '\\' || tmp8[tl-1] == '/')) tmp8[--tl] = '\0';
+                if (*rest) strcat(tmp8, rest);          /* rest 以 '/' 开头，语义与 POSIX 一致 */
+                return tmp8;
+            }
+        }
+    }
+    return path;
+#else
+    (void)path;
+    return path;
+#endif
+}
+
 /* 逐指针聚合净增量并释放。调用前本帧必须已弹出帧栈且 recording=0。 */
 static void reflog_rollback(TryFrame *f) {
     /* 顺序很关键：先回收无主的临时引用，再释放残留作用域。
@@ -3721,7 +3754,7 @@ static Value *builtin_bytes_to_str(int argc, Value **argv) {
 /* ---------- 文件读写：通用语言的基本能力 ---------- */
 static Value *builtin_read_file(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "读文件函数需要1个参数（路径）");
-    const char *path = str_arg(argv[0], "读文件");
+    const char *path = co_resolve_path(str_arg(argv[0], "读文件"));
     FILE *f = fopen(path, "rb");
     if (!f) runtime_error(NULL, "无法打开文件: %s", path);
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); runtime_error(NULL, "无法定位文件末尾: %s", path); }
@@ -3739,7 +3772,7 @@ static Value *builtin_read_file(int argc, Value **argv) {
 }
 static Value *file_write_impl(int argc, Value **argv, const char *mode, const char *who) {
     if (argc != 2) runtime_error(NULL, "%s函数需要2个参数（路径, 内容）", who);
-    const char *path = str_arg(argv[0], who);
+    const char *path = co_resolve_path(str_arg(argv[0], who));
     char *content = val_to_string(argv[1]);
     FILE *f = fopen(path, mode);   /* 调用方传 wb/ab：二进制模式，Windows 不篡改字节流 */
     if (!f) { free(content); runtime_error(NULL, "无法写入文件: %s", path); }
@@ -3754,13 +3787,15 @@ static Value *builtin_write_file(int argc, Value **argv)  { return file_write_im
 static Value *builtin_append_file(int argc, Value **argv) { return file_write_impl(argc, argv, "ab", "追加文件"); }
 static Value *builtin_file_exists(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "文件存在函数需要1个参数");
-    FILE *f = fopen(str_arg(argv[0], "文件存在"), "rb");
+    const char *path = co_resolve_path(str_arg(argv[0], "文件存在"));
+    FILE *f = fopen(path, "rb");
     if (f) { fclose(f); return val_bool(1); }
     return val_bool(0);
 }
 static Value *builtin_delete_file(int argc, Value **argv) {
     if (argc != 1) runtime_error(NULL, "删除文件函数需要1个参数");
-    return val_bool(remove(str_arg(argv[0], "删除文件")) == 0);
+    const char *path = co_resolve_path(str_arg(argv[0], "删除文件"));
+    return val_bool(remove(path) == 0);
 }
 /* 执行命令(命令串) -> 退出状态；自举编译器用它调用 cc 组装独立二进制 */
 static Value *builtin_exec(int argc, Value **argv) {
@@ -3787,6 +3822,177 @@ static Value *builtin_read_lines(int argc, Value **argv) {
     }
     val_free(whole);
     return r;
+}
+
+/* ========== 系统与通用函数 ==========
+   与操作系统交互（睡眠 / 退出 / 环境变量 / 高精度时钟）与值复制、
+   字符串格式化、字典合并。全部语义与文件 IO 一样属于通用语言基础设施。 */
+
+/* 等待毫秒(毫秒)：睡眠指定毫秒数。返回 空。 */
+static Value *builtin_sleep_ms(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "等待毫秒函数需要1个参数（毫秒数）");
+    long long ms = (long long)num_of(argv[0], "等待毫秒");
+    if (ms < 0) runtime_error(NULL, "等待毫秒的毫秒数不能为负: %lld", ms);
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+    return val_new(VAL_NULL);
+}
+
+/* 退出(状态码)：立即以给定状态码结束进程（供脚本按结果码退出） */
+static Value *builtin_exit(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "退出函数需要1个参数（状态码）");
+    int code = (int)num_of(argv[0], "退出");
+    if (code < 0 || code > 255) runtime_error(NULL, "退出状态码须在 0~255 之间，收到 %d", code);
+    exit(code);
+    return val_new(VAL_NULL);   /* 不可达：保持编译器对返回值的完整性认识 */
+}
+
+/* 环境变量(名) -> 值字符串；未设置时返回空字符串 */
+static Value *builtin_getenv(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "环境变量函数需要1个参数（变量名）");
+    const char *name = str_arg(argv[0], "环境变量");
+    const char *v = getenv(name);
+    Value *r = val_new(VAL_STRING);
+    r->sval = strdup(v ? v : "");
+    return r;
+}
+
+/* 设置环境变量(名, 值) -> 布尔：设置成功为 真（覆盖已存在的同名变量） */
+static Value *builtin_setenv(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "设置环境变量函数需要2个参数（变量名, 值）");
+    const char *name = str_arg(argv[0], "设置环境变量");
+    const char *val = str_arg(argv[1], "设置环境变量");
+    if (!*name) runtime_error(NULL, "设置环境变量的变量名不能为空");
+    int ok = 0;
+#ifdef _WIN32
+    ok = (_putenv_s(name, val) == 0);
+#else
+    ok = (setenv(name, val, 1) == 0);
+#endif
+    return val_bool(ok);
+}
+
+/* 时钟毫秒() -> 毫秒级时间戳（对比 时钟() 的秒级，适合精细测时） */
+static Value *builtin_clock_ms(int argc, Value **argv) {
+    (void)argc; (void)argv;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return val_int((long long)tv.tv_sec * 1000 + tv.tv_usec / 1000);
+}
+
+/* 格式化(模板, 参数...) -> 字符串。
+   模板中的 {} 依次替换为各参数的字符串表示；占位符数量必须与参数个数一致，
+   多一个或少一个都是缺陷（能跑但结果错），直接报中文错误。 */
+static Value *builtin_format(int argc, Value **argv) {
+    if (argc < 1) runtime_error(NULL, "格式化函数需要至少1个参数（模板）");
+    const char *tpl = str_arg(argv[0], "格式化");
+    int np = argc - 1;
+    int placeholders = 0;
+    size_t total = strlen(tpl) + 1;
+    for (const char *p = tpl; *p; p++) {
+        if (p[0] == '{' && p[1] == '}') { placeholders++; total -= 2; p++; }
+    }
+    if (placeholders != np)
+        runtime_error(NULL, "格式化模板有 %d 个占位符 {}，但提供了 %d 个参数", placeholders, np);
+    /* 参数串全部走 co_tmp_alloc：中途报错（如内存不足）longjmp 时统一回收 */
+    char **parts = (char **)co_tmp_alloc((size_t)np * sizeof(char *));
+    if (!parts) runtime_error(NULL, "内存不足（格式化参数表）");
+    for (int i = 0; i < np; i++) {
+        char *s = val_to_string(argv[i + 1]);
+        size_t sl = strlen(s);
+        parts[i] = (char *)co_tmp_alloc(sl + 1);
+        if (!parts[i]) { free(s); runtime_error(NULL, "内存不足（格式化参数）"); }
+        memcpy(parts[i], s, sl + 1);
+        free(s);
+        total += sl;
+    }
+    char *buf = (char *)co_tmp_alloc(total);
+    if (!buf) runtime_error(NULL, "内存不足（格式化输出）");
+    char *w = buf;
+    int pi = 0;
+    for (const char *p = tpl; *p; p++) {
+        if (p[0] == '{' && p[1] == '}') {
+            size_t sl = strlen(parts[pi]);
+            memcpy(w, parts[pi], sl);
+            w += sl;
+            pi++;
+            p++;
+        } else {
+            *w++ = *p;
+        }
+    }
+    *w = '\0';
+    Value *r = val_new(VAL_STRING);
+    r->sval = strdup(buf);
+    for (int i = 0; i < np; i++) co_tmp_free(parts[i]);
+    co_tmp_free(parts);
+    co_tmp_free(buf);
+    return r;
+}
+
+/* 复制(值) -> 值的拷贝：
+   标量返回等值新对象；字符串返回独立副本（改动互不影响）；
+   列表/字典复制容器、元素共享（浅拷贝）；张量深拷贝数据（不共享梯度/计算图）；
+   函数共享定义；并发任务句柄不可复制，明确报错。 */
+static Value *builtin_copy(int argc, Value **argv) {
+    if (argc != 1) runtime_error(NULL, "复制函数需要1个参数");
+    Value *v = argv[0];
+    switch (v->type) {
+    case VAL_INT:    return val_int(v->ival);
+    case VAL_FLOAT:  return val_flt(v->fval);
+    case VAL_BOOL:   return val_bool(v->ival);
+    case VAL_NULL:   return val_new(VAL_NULL);
+    case VAL_STRING: {
+        Value *r = val_new(VAL_STRING);
+        r->sval = strdup(v->sval);
+        return r;
+    }
+    case VAL_LIST: {
+        Value *r = list_new_empty();
+        for (int i = 0; i < v->list_len; i++) list_push(r, v->lval[i]);
+        return r;
+    }
+    case VAL_MAP: {
+        Value *r = val_new(VAL_MAP);
+        for (int i = 0; i < MAX_DICT_SIZE; i++) {
+            if (!v->mval->entries[i].used) continue;
+            dict_set(r->mval, v->mval->entries[i].key, v->mval->entries[i].val);
+        }
+        return r;
+    }
+    case VAL_TENSOR: {
+        Tensor *t = v->tval;
+        Tensor *nt = tensor_new(t->ndim, t->shape);
+        memcpy(nt->data, t->data, (size_t)t->size * sizeof(float));
+        Value *r = val_new(VAL_TENSOR);
+        r->tval = nt;
+        return r;
+    }
+    case VAL_FUNC:
+        return val_retain_root(v);
+    case VAL_TASK:
+        runtime_error(NULL, "复制函数不支持复制并发任务句柄");
+    }
+    return val_new(VAL_NULL);
+}
+
+/* 合并字典(目标, 源) -> 目标字典：把源的所有键值写入目标（同名键被覆盖），
+   与 追加/排序 一样返回目标本身以支持链式调用。 */
+static Value *builtin_dict_update(int argc, Value **argv) {
+    if (argc != 2) runtime_error(NULL, "合并字典函数需要2个参数（目标字典, 源字典）");
+    if (argv[0]->type != VAL_MAP) runtime_error(NULL, "合并字典的第一个参数必须是字典，收到 %s", val_type_name(argv[0]));
+    if (argv[1]->type != VAL_MAP) runtime_error(NULL, "合并字典的第二个参数必须是字典，收到 %s", val_type_name(argv[1]));
+    for (int i = 0; i < MAX_DICT_SIZE; i++) {
+        if (!argv[1]->mval->entries[i].used) continue;
+        dict_set(argv[0]->mval, argv[1]->mval->entries[i].key, argv[1]->mval->entries[i].val);
+    }
+    return val_retain(argv[0]);
 }
 
 /* ========== 自动求导 / 张量算子 ========== */
@@ -4623,7 +4829,7 @@ static Value *builtin_mae(int argc, Value **argv) {
    i32 参数个数；随后每个参数：i32 维数、i32 形状[维数]、float 数据[元素数]。 */
 static Value *builtin_save_model(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "保存模型需要2个参数: 路径, 参数列表");
-    const char *path = str_arg(argv[0], "保存模型");
+    const char *path = co_resolve_path(str_arg(argv[0], "保存模型"));
     if (argv[1]->type != VAL_LIST) runtime_error(NULL, "保存模型的第二个参数必须是参数列表");
     int n = argv[1]->list_len;
     for (int i = 0; i < n; i++)   /* 先统一校验，避免写一半留下残缺文件 */
@@ -4644,7 +4850,7 @@ static Value *builtin_save_model(int argc, Value **argv) {
 }
 static Value *builtin_load_model(int argc, Value **argv) {
     if (argc != 2) runtime_error(NULL, "加载模型需要2个参数: 路径, 参数列表");
-    const char *path = str_arg(argv[0], "加载模型");
+    const char *path = co_resolve_path(str_arg(argv[0], "加载模型"));
     if (argv[1]->type != VAL_LIST) runtime_error(NULL, "加载模型的第二个参数必须是参数列表");
     FILE *f = fopen(path, "rb");
     if (!f) runtime_error(NULL, "无法打开模型文件: %s", path);
@@ -4795,6 +5001,15 @@ static Value *call_builtin(const char *name, int argc, Value **argv) {
     if (strcmp(name, "删除文件") == 0) return builtin_delete_file(argc, argv);
     if (strcmp(name, "执行命令") == 0) return builtin_exec(argc, argv);
     if (strcmp(name, "读取行") == 0) return builtin_read_lines(argc, argv);
+    /* 系统与通用函数 */
+    if (strcmp(name, "等待毫秒") == 0) return builtin_sleep_ms(argc, argv);
+    if (strcmp(name, "退出") == 0) return builtin_exit(argc, argv);
+    if (strcmp(name, "环境变量") == 0) return builtin_getenv(argc, argv);
+    if (strcmp(name, "设置环境变量") == 0) return builtin_setenv(argc, argv);
+    if (strcmp(name, "时钟毫秒") == 0) return builtin_clock_ms(argc, argv);
+    if (strcmp(name, "格式化") == 0) return builtin_format(argc, argv);
+    if (strcmp(name, "复制") == 0) return builtin_copy(argc, argv);
+    if (strcmp(name, "合并字典") == 0) return builtin_dict_update(argc, argv);
     /* 张量 / 模型开发 */
     if (strcmp(name, "张量") == 0) return builtin_tensor(argc, argv);
     if (strcmp(name, "全零") == 0) return builtin_zeros(argc, argv);
@@ -6163,7 +6378,11 @@ static const char *ng_builtin_cname(const char *name) {
         /* 列表与文件/命令：自举编译器（在 coCN 里写、由 co --编译 编译）依赖它们 */
         {"追加","cv_b_append"},
         {"读文件","cv_b_readfile"},{"写文件","cv_b_writefile"},{"追加文件","cv_b_appendfile"},
-        {"文件存在","cv_b_fileexists"},{"执行命令","cv_b_system"},
+        {"文件存在","cv_b_fileexists"},{"删除文件","cv_b_deletefile"},{"读取行","cv_b_readlines"},{"执行命令","cv_b_system"},
+        /* 系统与通用函数（解释器 call_builtin 同名单注册） */
+        {"等待毫秒","cv_b_sleep"},{"退出","cv_b_exit"},
+        {"环境变量","cv_b_getenv"},{"设置环境变量","cv_b_setenv"},
+        {"时钟毫秒","cv_b_clockms"},{"格式化","cv_b_format"},{"复制","cv_b_copy"},
         {NULL,NULL}
     };
     for (int i = 0; tbl[i].cn; i++) if (strcmp(tbl[i].cn, name) == 0) return tbl[i].cf;
@@ -6568,6 +6787,9 @@ static void ng_function(NGen *g, Node *n) {
 static void ng_emit_runtime(FILE *out) {
     fputs("/* coCN 原生编译产物（由 co --生成C 自动生成，请勿手改） */\n", out);
     fputs("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <math.h>\n#include <stdarg.h>\n#include <ctype.h>\n#include <sys/time.h>\n", out);
+    fputs("#ifdef _WIN32\n#include <windows.h>\n#endif\n", out);
+    fputs("#ifdef _WIN32\n/* 文件函数统一走宽字符 API：CRT 的 fopen 按 ANSI 代码页解释路径，中文文件名在非 UTF-8 系统上必挂，与解释器侧行为对齐 */\nstatic FILE *cv_fopen_utf8(const char *path, const char *mode){\n    int wn = MultiByteToWideChar(CP_UTF8,0,path,-1,NULL,0);\n    int wm = MultiByteToWideChar(CP_UTF8,0,mode,-1,NULL,0);\n    if(wn<=0||wm<=0) return NULL;\n    wchar_t *wp=(wchar_t*)malloc((size_t)wn*sizeof(wchar_t));\n    wchar_t *wm2=(wchar_t*)malloc((size_t)wm*sizeof(wchar_t));\n    if(!wp||!wm2){ free(wp); free(wm2); return NULL; }\n    MultiByteToWideChar(CP_UTF8,0,path,-1,wp,wn);\n    MultiByteToWideChar(CP_UTF8,0,mode,-1,wm2,wm);\n    FILE *f=_wfopen(wp,wm2);\n    free(wp); free(wm2);\n    return f;\n}\nstatic int cv_remove_utf8(const char *path){\n    int wn=MultiByteToWideChar(CP_UTF8,0,path,-1,NULL,0);\n    if(wn<=0) return -1;\n    wchar_t *wp=(wchar_t*)malloc((size_t)wn*sizeof(wchar_t));\n    if(!wp) return -1;\n    MultiByteToWideChar(CP_UTF8,0,path,-1,wp,wn);\n    int r=_wremove(wp);\n    free(wp);\n    return r;\n}\n#define fopen cv_fopen_utf8\n#define remove cv_remove_utf8\nstatic int cv_wsystem_utf8(const char *cmd8){\n    int wn = MultiByteToWideChar(CP_UTF8,0,cmd8,-1,NULL,0);\n    if(wn<=0) return -1;\n    wchar_t *wcmd=(wchar_t*)malloc((size_t)wn*sizeof(wchar_t));\n    if(!wcmd) return -1;\n    MultiByteToWideChar(CP_UTF8,0,cmd8,-1,wcmd,wn);\n    int r=_wsystem(wcmd);\n    free(wcmd);\n    return r;\n}\n#define system cv_wsystem_utf8\n#endif\n", out);
+
     /* 运行时是【完整的】：脚本没用到的内置照样发射，方便 --生成C 产物被人
        二次修改与复用。但这会让 -Wunused-function 报一堆噪音，所以统一标注。 */
     fputs("#if defined(__GNUC__) || defined(__clang__)\n#  define CV_UNUSED __attribute__((unused))\n#else\n#  define CV_UNUSED\n#endif\n", out);
@@ -6606,10 +6828,12 @@ static void ng_emit_runtime(FILE *out) {
     fputs("      case CV_FLT: snprintf(buf,sizeof(buf),\"%g\",v.f); return cv_str_dup(buf);\n", out);
     fputs("      case CV_STR: return cv_str_dup(v.s?v.s:\"\"); case CV_LIST: return cv_list_str(v); default: return cv_str_dup(\"<未知>\"); } }\n", out);
     fputs("static CV_UNUSED char *cv_list_str(CoVal v){ size_t cap=32, len=0; char *b=(char*)malloc(cap); if(!b) cv_die(\"内存不足\"); b[len++]='['; if(v.l) for(long long k=0;k<v.l->len;k++){ if(k>0){ while(len+2>cap){ cap*=2; b=(char*)realloc(b,cap); if(!b) cv_die(\"内存不足\"); } b[len++]=','; b[len++]=' '; } char *e=cv_to_string(v.l->items[k]); size_t el=strlen(e); while(len+el+2>cap){ cap*=2; b=(char*)realloc(b,cap); if(!b) cv_die(\"内存不足\"); } memcpy(b+len,e,el); len+=el; free(e); } while(len+2>cap){ cap*=2; b=(char*)realloc(b,cap); if(!b) cv_die(\"内存不足\"); } b[len++]=']'; b[len]=0; return b; }\n", out);
+    fputs("static CV_UNUSED int cv_list_eq(CoVal a, CoVal b);\n", out);
     fputs("static CV_UNUSED int cv_eq(CoVal a, CoVal b){\n", out);
-    fputs("    if(a.tag==b.tag){ if(a.tag==CV_INT||a.tag==CV_BOOL) return a.i==b.i; if(a.tag==CV_FLT) return a.f==b.f; if(a.tag==CV_STR) return (a.s&&b.s)?(strcmp(a.s,b.s)==0):(a.s==b.s); if(a.tag==CV_NULL) return 1; }\n", out);
+    fputs("    if(a.tag==b.tag){ if(a.tag==CV_INT||a.tag==CV_BOOL) return a.i==b.i; if(a.tag==CV_FLT) return a.f==b.f; if(a.tag==CV_STR) return (a.s&&b.s)?(strcmp(a.s,b.s)==0):(a.s==b.s); if(a.tag==CV_LIST) return cv_list_eq(a,b); if(a.tag==CV_NULL) return 1; }\n", out);
     fputs("    if(cv_isnum(a)&&cv_isnum(b)) return cv_num(a)==cv_num(b);\n", out);
     fputs("    return 0;\n}\n", out);
+    fputs("static CV_UNUSED int cv_list_eq(CoVal a, CoVal b){ if(!a.l||!b.l) return a.l==b.l; if(a.l->len!=b.l->len) return 0; for(long long k=0;k<a.l->len;k++){ if(!cv_eq(a.l->items[k],b.l->items[k])) return 0; } return 1; }\n", out);
     fputs("static CV_UNUSED int cv_cmp(CoVal a, CoVal b){\n", out);
     fputs("    if(cv_isnum(a)&&cv_isnum(b)){ double x=cv_num(a),y=cv_num(b); return x<y?-1:(x>y?1:0); }\n", out);
     fputs("    if(a.tag==CV_STR&&b.tag==CV_STR) return strcmp(a.s?a.s:\"\", b.s?b.s:\"\");\n", out);
@@ -6707,12 +6931,57 @@ static void ng_emit_runtime(FILE *out) {
     fputs("static CV_UNUSED CoVal cv_b_clock(CoVal *a, int n){ (void)a; (void)n; struct timeval tv; gettimeofday(&tv,NULL); return cv_flt((double)tv.tv_sec+(double)tv.tv_usec/1000000.0); }\n", out);
     /* 列表：追加（原地改堆，返回原列表可链式） */
     fputs("static CV_UNUSED CoVal cv_b_append(CoVal *a, int n){ if(n!=2) cv_die(\"追加需要2个参数（列表, 元素）\"); cv_list_push(&a[0], a[1]); return cv_retain(a[0]); }\n", out);
-    /* 文件 IO 与命令执行：自举编译器读取源码、落盘 C、调用 cc 都靠它们 */
-    fputs("static CV_UNUSED CoVal cv_b_readfile(CoVal *a, int n){ if(n!=1) cv_die(\"读文件需要1个参数\"); const char *path=cv_sarg(a[0],\"读文件\"); FILE *f=fopen(path,\"rb\"); if(!f) cv_die(\"无法打开文件: %s\", path); if(fseek(f,0,SEEK_END)){ fclose(f); cv_die(\"无法定位文件末尾\"); } long long sz=ftell(f); rewind(f); char *buf=(char*)malloc((size_t)sz+1); if(!buf){ fclose(f); cv_die(\"内存不足\"); } size_t got=fread(buf,1,(size_t)sz,f); fclose(f); buf[got]=0; return cv_str_take(buf); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_writefile(CoVal *a, int n){ if(n!=2) cv_die(\"写文件需要2个参数（路径, 内容）\"); const char *path=cv_sarg(a[0],\"写文件\"); char *c=cv_to_string(a[1]); size_t cl=strlen(c); FILE *f=fopen(path,\"wb\"); if(!f){ free(c); cv_die(\"无法写入文件: %s\", path); } size_t w=fwrite(c,1,cl,f); int e=fclose(f); free(c); if(w!=cl||e) cv_die(\"写入文件未完成: %s\", path); return cv_int((long long)w); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_appendfile(CoVal *a, int n){ if(n!=2) cv_die(\"追加文件需要2个参数（路径, 内容）\"); const char *path=cv_sarg(a[0],\"追加文件\"); char *c=cv_to_string(a[1]); size_t cl=strlen(c); FILE *f=fopen(path,\"ab\"); if(!f){ free(c); cv_die(\"无法写入文件: %s\", path); } size_t w=fwrite(c,1,cl,f); int e=fclose(f); free(c); if(w!=cl||e) cv_die(\"写入文件未完成: %s\", path); return cv_int((long long)w); }\n", out);
-    fputs("static CV_UNUSED CoVal cv_b_fileexists(CoVal *a, int n){ (void)n; const char *p=cv_sarg(a[0],\"文件存在\"); FILE *f=fopen(p,\"rb\"); int ok=f?1:0; if(f) fclose(f); return cv_bool(ok); }\n", out);
+    /* /tmp 在 POSIX 是约定临时目录，Windows 没有：映射到系统临时目录，
+       与解释器 co_resolve_path 行为一致，保证两条通道语义相同。 */
+    fputs("static CV_UNUSED const char *cv_resolve(const char *p){\n", out);
+    fputs("#ifdef _WIN32\n", out);
+    fputs("    if(p && strncmp(p,\"/tmp\",4)==0 && (p[4]==0||p[4]=='/'||p[4]=='\\\\')){\n", out);
+    fputs("        const char *t=getenv(\"TEMP\"); if(!t||!*t) t=getenv(\"TMP\"); if(!t) t=\".\";\n", out);
+    fputs("        static char b[32768];\n", out);
+    fputs("        size_t tl=strlen(t); while(tl>0 && (t[tl-1]=='\\\\'||t[tl-1]=='/')) tl--;\n", out);
+    fputs("        if(tl>sizeof(b)-2) tl=sizeof(b)-2;\n", out);
+    fputs("        memcpy(b,t,tl);\n", out);
+    fputs("        if(p[4]){ b[tl]='/'; strncpy(b+tl+1,p+5,sizeof(b)-tl-2); b[sizeof(b)-1]=0; }\n", out);
+    fputs("        else b[tl]=0;\n", out);
+    fputs("        return b;\n", out);
+    fputs("    }\n", out);
+    fputs("#endif\n", out);
+    fputs("    return p;\n", out);
+    fputs("}\n", out);    /* 文件 IO 与命令执行：自举编译器读取源码、落盘 C、调用 cc 都靠它们 */
+    fputs("static CV_UNUSED CoVal cv_b_readfile(CoVal *a, int n){ if(n!=1) cv_die(\"读文件需要1个参数\"); const char *path=cv_resolve(cv_sarg(a[0],\"读文件\")); FILE *f=fopen(path,\"rb\"); if(!f) cv_die(\"无法打开文件: %s\", path); if(fseek(f,0,SEEK_END)){ fclose(f); cv_die(\"无法定位文件末尾\"); } long long sz=ftell(f); rewind(f); char *buf=(char*)malloc((size_t)sz+1); if(!buf){ fclose(f); cv_die(\"内存不足\"); } size_t got=fread(buf,1,(size_t)sz,f); fclose(f); buf[got]=0; return cv_str_take(buf); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_writefile(CoVal *a, int n){ if(n!=2) cv_die(\"写文件需要2个参数（路径, 内容）\"); const char *path=cv_resolve(cv_sarg(a[0],\"写文件\")); char *c=cv_to_string(a[1]); size_t cl=strlen(c); FILE *f=fopen(path,\"wb\"); if(!f){ free(c); cv_die(\"无法写入文件: %s\", path); } size_t w=fwrite(c,1,cl,f); int e=fclose(f); free(c); if(w!=cl||e) cv_die(\"写入文件未完成: %s\", path); return cv_int((long long)w); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_appendfile(CoVal *a, int n){ if(n!=2) cv_die(\"追加文件需要2个参数（路径, 内容）\"); const char *path=cv_resolve(cv_sarg(a[0],\"追加文件\")); char *c=cv_to_string(a[1]); size_t cl=strlen(c); FILE *f=fopen(path,\"ab\"); if(!f){ free(c); cv_die(\"无法写入文件: %s\", path); } size_t w=fwrite(c,1,cl,f); int e=fclose(f); free(c); if(w!=cl||e) cv_die(\"写入文件未完成: %s\", path); return cv_int((long long)w); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_fileexists(CoVal *a, int n){ (void)n; const char *p=cv_resolve(cv_sarg(a[0],\"文件存在\")); FILE *f=fopen(p,\"rb\"); int ok=f?1:0; if(f) fclose(f); return cv_bool(ok); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_deletefile(CoVal *a, int n){ (void)n; const char *p=cv_resolve(cv_sarg(a[0],\"删除文件\")); return cv_bool(remove(p)==0); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_readlines(CoVal *a, int n){ if(n!=1) cv_die(\"读取行需要1个参数（路径）\"); CoVal whole=cv_b_readfile(a,n); CoVal r=cv_list_new(); char *p=whole.s?whole.s:\"\"; while(*p){ char *q=strchr(p,'\\n'); size_t ln=q?(size_t)(q-p):strlen(p); if(ln>0 && p[ln-1]=='\\r') ln--; char *b=(char*)malloc(ln+1); if(!b) cv_die(\"内存不足\"); memcpy(b,p,ln); b[ln]=0; cv_list_push(&r, cv_str_take(b)); if(!q) break; p=q+1; } cv_free(whole); return r; }\n", out);
     fputs("static CV_UNUSED CoVal cv_b_system(CoVal *a, int n){ (void)n; const char *cmd=cv_sarg(a[0],\"执行命令\"); int r=system(cmd); return cv_int(r); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_sleep(CoVal *a, int n){ if(n!=1) cv_die(\"等待毫秒需要1个参数（毫秒数）\"); long long ms=(long long)cv_num(a[0]); if(ms<0) cv_die(\"等待毫秒的毫秒数不能为负: %lld\", ms);\n", out);
+    fputs("#ifdef _WIN32\n", out);
+    fputs("    Sleep((DWORD)ms);\n", out);
+    fputs("#else\n", out);
+    fputs("    struct timespec ts; ts.tv_sec=ms/1000; ts.tv_nsec=(long)(ms%1000)*1000000L; nanosleep(&ts,NULL);\n", out);
+    fputs("#endif\n", out);
+    fputs("    return cv_null(); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_exit(CoVal *a, int n){ if(n!=1) cv_die(\"退出需要1个参数（状态码）\"); int code=(int)cv_num(a[0]); if(code<0||code>255) cv_die(\"退出状态码须在 0~255 之间，收到 %d\", code); exit(code); return cv_null(); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_getenv(CoVal *a, int n){ (void)n; const char *name=cv_sarg(a[0],\"环境变量\"); const char *v=getenv(name); return cv_str_dupv(v?v:\"\"); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_setenv(CoVal *a, int n){ if(n!=2) cv_die(\"设置环境变量需要2个参数（变量名, 值）\"); const char *name=cv_sarg(a[0],\"设置环境变量\"); const char *val=cv_sarg(a[1],\"设置环境变量\"); if(!*name) cv_die(\"设置环境变量的变量名不能为空\"); int ok=0;\n", out);
+    fputs("#ifdef _WIN32\n", out);
+    fputs("    ok=(_putenv_s(name,val)==0);\n", out);
+    fputs("#else\n", out);
+    fputs("    ok=(setenv(name,val,1)==0);\n", out);
+    fputs("#endif\n", out);
+    fputs("    return cv_bool(ok); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_clockms(CoVal *a, int n){ (void)a; (void)n; struct timeval tv; gettimeofday(&tv,NULL); return cv_int((long long)tv.tv_sec*1000+tv.tv_usec/1000); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_format(CoVal *a, int n){ if(n<1) cv_die(\"格式化需要至少1个参数（模板）\"); const char *tpl=cv_sarg(a[0],\"格式化\"); int np=n-1; int ph=0; size_t total=strlen(tpl)+1; for(const char *p=tpl;*p;p++){ if(p[0]=='{'&&p[1]=='}'){ ph++; total-=2; p++; } } if(ph!=np) cv_die(\"格式化模板有 %d 个占位符 {}，但提供了 %d 个参数\", ph, np); for(int i=0;i<np;i++){ char *s=cv_to_string(a[i+1]); total+=strlen(s); free(s); } char *buf=(char*)malloc(total); if(!buf) cv_die(\"内存不足\"); char *w=buf; int pi=0; for(const char *p=tpl;*p;p++){ if(p[0]=='{'&&p[1]=='}'){ char *s=cv_to_string(a[pi+1]); size_t sl=strlen(s); memcpy(w,s,sl); w+=sl; free(s); pi++; p++; } else *w++=*p; } *w=0; return cv_str_take(buf); }\n", out);
+    fputs("static CV_UNUSED CoVal cv_b_copy(CoVal *a, int n){ (void)n; CoVal v=a[0]; switch(v.tag){\n", out);
+    fputs("    case CV_INT: return cv_int(v.i);\n", out);
+    fputs("    case CV_FLT: return cv_flt(v.f);\n", out);
+    fputs("    case CV_BOOL: return cv_bool(v.i);\n", out);
+    fputs("    case CV_NULL: return cv_null();\n", out);
+    fputs("    case CV_STR: return cv_str_dupv(v.s?v.s:\"\");\n", out);
+    fputs("    case CV_LIST: { CoVal r=cv_list_new(); if(v.l) for(long long k=0;k<v.l->len;k++) cv_list_push(&r, v.l->items[k]); return r; }\n", out);
+    fputs("    default: cv_die(\"复制函数不支持该类型\"); return cv_null(); } }\n", out);
+    fputs("\n", out);
     fputs("\n", out);
 }
 
